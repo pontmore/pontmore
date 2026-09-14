@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "pip00-valid-basic",
+      "spec": "PIP-00 Content Schema and Required Tags",
+      "input": {
+        "type": "agent_definition",
+        "content": {
+          "version": 1,
+          "capabilities": ["pontmore/swap@1"]
+        },
+        "tags": [
+          ["d", "agent"],
+          ["t", "agent"],
+          ["t", "pontmore-capability:pontmore/swap@1"]
+        ]
+      },
+      "expected": { "valid": true, "error_codes": [] }
+    },
+    {
+      "id": "pip00-empty-capabilities",
+      "spec": "PIP-00 Content Schema",
+      "input": {
+        "type": "agent_definition",
+        "content": { "version": 1, "capabilities": [] },
+        "tags": [["d", "agent"], ["t", "agent"]]
+      },
+      "expected": { "valid": false, "error_codes": ["EMPTY_CAPABILITIES"] }
+    },
+    {
+      "id": "pip00-missing-d-and-agent-tags",
+      "spec": "PIP-00 Required Tags",
+      "input": {
+        "type": "agent_definition",
+        "content": {
+          "version": 1,
+          "capabilities": ["pontmore/swap@1"]
+        },
+        "tags": [["t", "pontmore-capability:pontmore/swap@1"]]
+      },
+      "expected": {
+        "valid": false,
+        "error_codes": ["MISSING_AGENT_TAG", "MISSING_D_TAG"]
+      }
+    },
+    {
+      "id": "pip00-invalid-capability-version",
+      "spec": "PIP-00 Content Schema",
+      "input": {
+        "type": "agent_definition",
+        "content": {
+          "version": 1,
+          "capabilities": ["pontmore/swap@0"]
+        },
+        "tags": [
+          ["d", "agent"],
+          ["t", "agent"],
+          ["t", "pontmore-capability:pontmore/swap@0"]
+        ]
+      },
+      "expected": { "valid": false, "error_codes": ["INVALID_CAPABILITY_ID"] }
+    },
+    {
+      "id": "pip00-content-tag-mismatch-both-directions",
+      "spec": "PIP-00 Required Tags",
+      "input": {
+        "type": "agent_definition",
+        "content": {
+          "version": 1,
+          "capabilities": ["pontmore/swap@1"]
+        },
+        "tags": [
+          ["d", "agent"],
+          ["t", "agent"],
+          ["t", "pontmore-capability:example/other@1"]
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_codes": ["CAPABILITY_TAG_MISSING", "CAPABILITY_TAG_UNDECLARED"]
+      }
+    },
+    {
+      "id": "pip00-unsupported-content-version",
+      "spec": "PIP-00 Content Schema",
+      "input": {
+        "type": "agent_definition",
+        "content": {
+          "version": 2,
+          "capabilities": ["pontmore/swap@1"]
+        },
+        "tags": [
+          ["d", "agent"],
+          ["t", "agent"],
+          ["t", "pontmore-capability:pontmore/swap@1"]
+        ]
+      },
+      "expected": { "valid": false, "error_codes": ["UNSUPPORTED_VERSION"] }
+    }
+  ]
+}
+

@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "pip01-valid-cashu-service",
+      "spec": "PIP-01 Minimum Content, Service Schema, and Selection Rules",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "cashu_escrow",
+          "networks": ["cashu"],
+          "service": {
+            "schema": {
+              "type": "openapi",
+              "url": "https://example.com/escrow-v1.json"
+            }
+          },
+          "expires_at": 200
+        },
+        "tags": [
+          ["d", "cashu-main"],
+          ["t", "pontmore-network:cashu"]
+        ],
+        "selection": {
+          "validation_time": 100,
+          "is_current_revision": true
+        }
+      },
+      "expected": { "valid": true, "error_codes": [] }
+    },
+    {
+      "id": "pip01-network-index-tag-is-recommended-not-required",
+      "spec": "PIP-01 Minimum Content",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "cashu_escrow",
+          "networks": ["cashu"],
+          "expires_at": 200
+        },
+        "tags": [["d", "cashu-main"]]
+      },
+      "expected": { "valid": true, "error_codes": [] }
+    },
+    {
+      "id": "pip01-network-index-tag-cannot-invent-network",
+      "spec": "PIP-01 Minimum Content",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "custodial_escrow",
+          "networks": ["lightning"],
+          "expires_at": 200
+        },
+        "tags": [
+          ["d", "custodial-main"],
+          ["t", "pontmore-network:cashu"]
+        ]
+      },
+      "expected": { "valid": false, "error_codes": ["NETWORK_TAG_UNDECLARED"] }
+    },
+    {
+      "id": "pip01-cashu-mechanism-requires-cashu-network",
+      "spec": "PIP-01 Escrow Types",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "cashu_escrow",
+          "networks": ["lightning"],
+          "expires_at": 200
+        },
+        "tags": [["d", "bad-cashu"]]
+      },
+      "expected": { "valid": false, "error_codes": ["REQUIRED_NETWORK_MISSING"] }
+    },
+    {
+      "id": "pip01-selection-requires-current-revision",
+      "spec": "PIP-01 Descriptor Lifecycle",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "lightning_hold_invoice",
+          "networks": ["lightning"],
+          "expires_at": 200
+        },
+        "tags": [["d", "lightning-main"]],
+        "selection": {
+          "validation_time": 100,
+          "is_current_revision": false
+        }
+      },
+      "expected": { "valid": false, "error_codes": ["DESCRIPTOR_NOT_CURRENT"] }
+    },
+    {
+      "id": "pip01-expiry-boundary-is-exclusive",
+      "spec": "PIP-01 Descriptor Lifecycle",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "lightning_hold_invoice",
+          "networks": ["lightning"],
+          "expires_at": 200
+        },
+        "tags": [["d", "lightning-main"]],
+        "selection": {
+          "validation_time": 200,
+          "is_current_revision": true
+        }
+      },
+      "expected": { "valid": false, "error_codes": ["DESCRIPTOR_EXPIRED"] }
+    },
+    {
+      "id": "pip01-schema-must-be-https",
+      "spec": "PIP-01 Service Schema",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "custodial_escrow",
+          "networks": ["lightning"],
+          "service": {
+            "schema": {
+              "type": "openapi",
+              "url": "http://example.com/escrow.json"
+            }
+          },
+          "expires_at": 200
+        },
+        "tags": [["d", "custodial-main"]]
+      },
+      "expected": { "valid": false, "error_codes": ["INVALID_SCHEMA_URL"] }
+    },
+    {
+      "id": "pip01-schema-type-is-bounded",
+      "spec": "PIP-01 Service Schema",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "custodial_escrow",
+          "networks": ["lightning"],
+          "service": {
+            "schema": {
+              "type": "graphql",
+              "url": "https://example.com/escrow.graphql"
+            }
+          },
+          "expires_at": 200
+        },
+        "tags": [["d", "custodial-main"]]
+      },
+      "expected": { "valid": false, "error_codes": ["UNSUPPORTED_SCHEMA_TYPE"] }
+    },
+    {
+      "id": "pip01-identifiers-are-lowercase",
+      "spec": "PIP-01 Minimum Content",
+      "input": {
+        "type": "escrow_descriptor",
+        "content": {
+          "version": 1,
+          "escrow_type": "Cashu_Escrow",
+          "networks": ["Cashu"],
+          "expires_at": 200
+        },
+        "tags": [["d", "cashu-main"]]
+      },
+      "expected": {
+        "valid": false,
+        "error_codes": ["ESCROW_TYPE_NOT_LOWERCASE", "NETWORK_ID_NOT_LOWERCASE"]
+      }
+    }
+  ]
+}

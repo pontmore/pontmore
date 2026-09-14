@@ -1,0 +1,17 @@
+[package]
+name = "pontmore-tck"
+description = "Compatibility-vector runner for Pontmore implementations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pontmore-core = { path = "../pontmore-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+

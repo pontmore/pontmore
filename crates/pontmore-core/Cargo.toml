@@ -1,0 +1,17 @@
+[package]
+name = "pontmore-core"
+description = "Deterministic validation and reconstruction for the Pontmore protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
+
