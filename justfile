@@ -1,5 +1,5 @@
 set shell := ["bash", "-euc"]
-set unstable := true
+set unstable
 
 default: check
 

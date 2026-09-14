@@ -208,10 +208,7 @@ pub fn validate_swap_coordination(
     let mut applied = Vec::new();
     let mut processed = BTreeSet::new();
 
-    loop {
-        let Some(candidates) = children.get(&tip) else {
-            break;
-        };
+    while let Some(candidates) = children.get(&tip) {
         let mut valid = Vec::new();
         for candidate in candidates {
             processed.insert(candidate.event.id.to_hex());
