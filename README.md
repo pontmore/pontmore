@@ -14,19 +14,35 @@ The first executable slice provides:
 - deterministic validation of PIP-00 Agent-definition content and indexing tags;
 - deterministic validation of PIP-01 escrow-descriptor content, indexing tags,
   mechanism/network compatibility, and caller-supplied selection context;
+- signed PIP-02 version 2 root/action validation and deterministic
+  `pontmore/swap@1` reconstruction over unordered event sets;
+- authorization, deadline, dispute, finality, replay, and sibling-fork
+  enforcement for the experimental swap profile;
 - stable machine-readable validation error codes;
 - language-neutral JSON compatibility vectors; and
 - a `pontmore-tck` command that executes those vectors.
 
 Support is **experimental**. This first slice does not yet implement:
 
-- Nostr event ID or signature verification;
 - relay synchronization or addressable-event revision discovery;
 - DNS-aware service-schema fetch safety;
-- PIP-02 coordination reconstruction or `pontmore/swap@1`;
 - persistence, signing, plugins, or economic side effects.
 
 Those omissions are hard validation boundaries, not implied conformance.
+
+### PIP-02 boundary
+
+`validate_swap_coordination` accepts complete signed kind `7300` and `7301`
+events plus a `DescriptorBinding`. The binding is an explicit input containing
+PIP-01 currentness, lifetime, network, and service-authority facts established
+outside the reducer. Supplying it does not turn an index or database record into
+canonical protocol state.
+
+The reducer currently supports only PIP-02 content version 2 with the exact
+`pontmore/swap@1` profile. It rejects other versions and profiles. Fork recovery,
+private commitment payload verification, descriptor retrieval, and evaluation
+of whether an opaque payment reference leaks private data remain outside this
+pure reconstruction slice.
 
 ## Workspace
 
@@ -56,8 +72,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Protocol baseline
 
-Development started from Pontmore protocol commit
+The implemented rules are pinned to Pontmore protocol commit
 `d9a1eb3e8a24e2101f5a4024df1ce85a8d934f75` dated 2026-09-14.
+
+PIP-02 and `pontmore/swap@1` remain experimental. The implementation makes no
+interoperability claim until an independently developed implementation runs the
+same signed vectors successfully.
 
 ## License
 

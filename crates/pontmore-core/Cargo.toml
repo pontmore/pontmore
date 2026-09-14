@@ -10,8 +10,11 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+nostr.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+nostr = { workspace = true, features = ["os-rng"] }
 
 [lints]
 workspace = true
-

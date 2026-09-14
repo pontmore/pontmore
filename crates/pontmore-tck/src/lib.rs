@@ -7,7 +7,8 @@ use std::{
 };
 
 use pontmore_core::{
-    DescriptorSelection, ErrorCode, Tag, validate_agent_definition, validate_escrow_descriptor,
+    CoordinationState, DescriptorBinding, DescriptorSelection, ErrorCode, Tag,
+    validate_agent_definition, validate_escrow_descriptor, validate_swap_coordination,
 };
 use serde::Deserialize;
 
@@ -29,10 +30,18 @@ struct VectorCase {
 struct VectorInput {
     #[serde(rename = "type")]
     input_type: InputType,
-    content: serde_json::Value,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
     tags: Vec<Tag>,
     #[serde(default)]
     selection: Option<DescriptorSelection>,
+    #[serde(default)]
+    root: Option<nostr::event::Event>,
+    #[serde(default)]
+    actions: Vec<nostr::event::Event>,
+    #[serde(default)]
+    descriptor: Option<DescriptorBinding>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +49,7 @@ struct VectorInput {
 enum InputType {
     AgentDefinition,
     EscrowDescriptor,
+    SwapCoordination,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +57,12 @@ struct Expected {
     valid: bool,
     #[serde(default)]
     error_codes: BTreeSet<ErrorCode>,
+    #[serde(default)]
+    state: Option<CoordinationState>,
+    #[serde(default)]
+    rejection_codes: BTreeSet<ErrorCode>,
+    #[serde(default)]
+    fork: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,13 +117,22 @@ pub fn run_path(path: &Path) -> Result<RunSummary, String> {
 }
 
 fn run_case(path: &Path, case: &VectorCase, failures: &mut Vec<String>) -> Result<(), String> {
-    let content = serde_json::to_string(&case.input.content)
+    if matches!(case.input.input_type, InputType::SwapCoordination) {
+        return run_coordination_case(path, case, failures);
+    }
+    let content = case
+        .input
+        .content
+        .as_ref()
+        .ok_or_else(|| format!("{}:{}: missing content", path.display(), case.id))?;
+    let content = serde_json::to_string(content)
         .map_err(|error| format!("{}:{}: {error}", path.display(), case.id))?;
     let errors = match case.input.input_type {
         InputType::AgentDefinition => validate_agent_definition(&content, &case.input.tags),
         InputType::EscrowDescriptor => {
             validate_escrow_descriptor(&content, &case.input.tags, case.input.selection)
         }
+        InputType::SwapCoordination => unreachable!("handled above"),
     };
     let actual: BTreeSet<ErrorCode> = errors.iter().map(|error| error.code).collect();
     let actual_valid = errors.is_empty();
@@ -121,6 +146,65 @@ fn run_case(path: &Path, case: &VectorCase, failures: &mut Vec<String>) -> Resul
             case.expected.error_codes,
             actual_valid
         ));
+    }
+    Ok(())
+}
+
+fn run_coordination_case(
+    path: &Path,
+    case: &VectorCase,
+    failures: &mut Vec<String>,
+) -> Result<(), String> {
+    let root = case
+        .input
+        .root
+        .as_ref()
+        .ok_or_else(|| format!("{}:{}: missing root", path.display(), case.id))?;
+    let descriptor = case
+        .input
+        .descriptor
+        .as_ref()
+        .ok_or_else(|| format!("{}:{}: missing descriptor", path.display(), case.id))?;
+    match validate_swap_coordination(root, &case.input.actions, descriptor) {
+        Ok(result) => {
+            let rejections: BTreeSet<ErrorCode> =
+                result.rejections.iter().map(|item| item.code).collect();
+            let matches = case.expected.valid
+                && case.expected.error_codes.is_empty()
+                && case.expected.state == Some(result.state)
+                && case.expected.rejection_codes == rejections
+                && case
+                    .expected
+                    .fork
+                    .is_none_or(|fork| fork == result.fork.is_some());
+            if !matches {
+                failures.push(format!(
+                    "{}:{} [{}] expected state={:?} rejections={:?} fork={:?}; got state={:?} rejections={:?} fork={}",
+                    path.display(),
+                    case.id,
+                    case.spec,
+                    case.expected.state,
+                    case.expected.rejection_codes,
+                    case.expected.fork,
+                    result.state,
+                    rejections,
+                    result.fork.is_some()
+                ));
+            }
+        }
+        Err(errors) => {
+            let actual: BTreeSet<ErrorCode> = errors.iter().map(|error| error.code).collect();
+            if case.expected.valid || actual != case.expected.error_codes {
+                failures.push(format!(
+                    "{}:{} [{}] expected valid={} errors={:?}; got root errors={actual:?}",
+                    path.display(),
+                    case.id,
+                    case.spec,
+                    case.expected.valid,
+                    case.expected.error_codes
+                ));
+            }
+        }
     }
     Ok(())
 }

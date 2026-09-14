@@ -9,6 +9,13 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+mod pip02;
+
+pub use pip02::{
+    CoordinationState, DescriptorBinding, EventRejection, ForkEvidence, Reconstruction,
+    ResolutionEffect, validate_swap_coordination,
+};
+
 /// A decoded Nostr tag.
 pub type Tag = Vec<String>;
 
@@ -35,6 +42,21 @@ pub enum ErrorCode {
     InvalidSchemaUrl,
     DescriptorNotCurrent,
     DescriptorExpired,
+    InvalidEvent,
+    InvalidEventKind,
+    UnsupportedProfile,
+    InvalidDescriptorBinding,
+    InvalidRoles,
+    InvalidTerms,
+    InvalidCommitment,
+    InvalidActionTags,
+    UnknownAction,
+    UnauthorizedSigner,
+    InvalidActionData,
+    InvalidTransition,
+    ActionAfterTerminal,
+    DuplicateEvent,
+    OutOfOrderAction,
 }
 
 /// One deterministic validation failure.
@@ -46,7 +68,11 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    fn new(code: ErrorCode, path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        code: ErrorCode,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             code,
             path: path.into(),
