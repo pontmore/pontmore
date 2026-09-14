@@ -46,6 +46,7 @@ pub enum EconomicOperation {
 #[derive(Debug, Clone)]
 pub struct ConnectorExecution {
     pub operation_id: Uuid,
+    pub idempotency_key: String,
     pub coordination_id: String,
     pub profile: String,
     pub network: String,
@@ -65,6 +66,8 @@ pub struct ConnectorManifest {
     pub supported_profiles: Vec<String>,
     #[serde(default)]
     pub supported_networks: Vec<String>,
+    #[serde(default)]
+    pub authority_pubkeys: Vec<String>,
     pub entrypoint: PathBuf,
     pub entrypoint_sha256: String,
     pub source: String,
@@ -79,6 +82,7 @@ enum ConnectorCommand {
     Health,
     Execute {
         operation_id: Uuid,
+        idempotency_key: String,
         coordination_id: String,
         profile: String,
         network: String,
@@ -248,7 +252,37 @@ impl ConnectorProcess {
 
 struct InstalledConnector {
     manifest: ConnectorManifest,
-    process: Mutex<ConnectorProcess>,
+    entrypoint: PathBuf,
+    expected_digest: String,
+    exchange_timeout: Duration,
+    process: Mutex<Option<ConnectorProcess>>,
+}
+
+impl InstalledConnector {
+    async fn exchange(&self, command: ConnectorCommand) -> Result<ConnectorResult, ConnectorError> {
+        let mut process = self.process.lock().await;
+        if process.is_none() {
+            *process = Some(
+                ConnectorProcess::spawn(
+                    self.entrypoint.clone(),
+                    self.expected_digest.clone(),
+                    self.exchange_timeout,
+                )
+                .await?,
+            );
+        }
+        let result = process
+            .as_mut()
+            .expect("connector process was initialized")
+            .exchange(command)
+            .await;
+        if result.is_err()
+            && let Some(mut failed) = process.take()
+        {
+            let _ = failed.child.kill().await;
+        }
+        result
+    }
 }
 
 /// Static manager for long-lived economic connector subprocesses.
@@ -290,7 +324,7 @@ impl ConnectorManager {
             let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
             let entrypoint = base.join(&manifest.entrypoint);
             let process = ConnectorProcess::spawn(
-                entrypoint,
+                entrypoint.clone(),
                 manifest.entrypoint_sha256.clone(),
                 exchange_timeout,
             )
@@ -299,7 +333,10 @@ impl ConnectorManager {
                 expected_id,
                 Arc::new(InstalledConnector {
                     manifest,
-                    process: Mutex::new(process),
+                    entrypoint,
+                    expected_digest: process.expected_digest.clone(),
+                    exchange_timeout,
+                    process: Mutex::new(Some(process)),
                 }),
             );
         }
@@ -314,6 +351,51 @@ impl ConnectorManager {
             .values()
             .map(|connector| connector.manifest.clone())
             .collect()
+    }
+
+    /// Select the only connector authorized for an exact profile, network, and
+    /// protocol authority. Returns `None` when this node does not operate that authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when configuration has more than one eligible connector.
+    pub fn select(
+        &self,
+        connector_type: ConnectorType,
+        profile: &str,
+        network: &str,
+        authority_pubkey: &str,
+    ) -> Result<Option<String>, ConnectorError> {
+        let matches = self
+            .connectors
+            .values()
+            .filter(|connector| {
+                connector.manifest.connector_type == connector_type
+                    && connector
+                        .manifest
+                        .supported_profiles
+                        .iter()
+                        .any(|supported| supported == profile)
+                    && connector
+                        .manifest
+                        .supported_networks
+                        .iter()
+                        .any(|supported| supported == network)
+                    && connector
+                        .manifest
+                        .authority_pubkeys
+                        .iter()
+                        .any(|supported| supported == authority_pubkey)
+            })
+            .map(|connector| connector.manifest.id.clone())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [connector_id] => Ok(Some(connector_id.clone())),
+            _ => Err(ConnectorError::Configuration(format!(
+                "multiple connectors match {connector_type:?}, `{profile}`, `{network}`, and authority `{authority_pubkey}`"
+            ))),
+        }
     }
 
     /// Probe one connector over its existing subprocess session.
@@ -377,6 +459,7 @@ impl ConnectorManager {
             connector_id,
             ConnectorCommand::Execute {
                 operation_id: execution.operation_id,
+                idempotency_key: execution.idempotency_key,
                 coordination_id: execution.coordination_id,
                 profile: execution.profile,
                 network: execution.network,
@@ -410,18 +493,17 @@ impl ConnectorManager {
             .connectors
             .get(connector_id)
             .ok_or_else(|| ConnectorError::NotConfigured(connector_id.to_owned()))?;
-        connector.process.lock().await.exchange(command).await
+        connector.exchange(command).await
     }
 
     /// Ask every connector to stop cleanly.
     pub async fn shutdown(&self) {
         for connector in self.connectors.values() {
-            let _ = connector
-                .process
-                .lock()
-                .await
-                .exchange(ConnectorCommand::Shutdown)
-                .await;
+            let mut process = connector.process.lock().await;
+            if let Some(mut running) = process.take() {
+                let _ = running.exchange(ConnectorCommand::Shutdown).await;
+                let _ = running.child.wait().await;
+            }
         }
     }
 }
@@ -455,6 +537,18 @@ fn validate_manifest(
     if manifest.source.trim().is_empty() {
         return Err(ConnectorError::Configuration(format!(
             "connector `{expected_id}` requires source provenance"
+        )));
+    }
+    if manifest.authority_pubkeys.is_empty()
+        || manifest.authority_pubkeys.iter().any(|pubkey| {
+            pubkey.len() != 64
+                || !pubkey
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(ConnectorError::Configuration(format!(
+            "connector `{expected_id}` requires lowercase 32-byte authority pubkeys"
         )));
     }
     Ok(())
@@ -498,6 +592,7 @@ mod tests {
             connector_type: ConnectorType::Escrow,
             supported_profiles: vec![],
             supported_networks: vec![],
+            authority_pubkeys: vec!["0".repeat(64)],
             entrypoint: PathBuf::from("../escape"),
             entrypoint_sha256: "0".repeat(64),
             source: "https://example.test/source".to_owned(),
@@ -522,6 +617,7 @@ mod tests {
                 "pontmore/simulated-escrow",
                 ConnectorExecution {
                     operation_id,
+                    idempotency_key: "coordination:accept:escrow_secure".to_owned(),
                     coordination_id: "coordination".to_owned(),
                     profile: "pontmore/swap@1".to_owned(),
                     network: "regtest".to_owned(),
@@ -538,6 +634,36 @@ mod tests {
             .await
             .expect("inspection should succeed");
         assert_eq!(inspection.result["status"], json!("succeeded"));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_connector_is_restarted_before_the_next_exchange() {
+        let config =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors.example.json");
+        let manager = ConnectorManager::load(Some(&config), Duration::from_secs(2))
+            .await
+            .expect("example connector should load");
+        let failed = manager
+            .execute(
+                "pontmore/simulated-escrow",
+                ConnectorExecution {
+                    operation_id: Uuid::new_v4(),
+                    idempotency_key: "coordination:failure:escrow_secure".to_owned(),
+                    coordination_id: "coordination".to_owned(),
+                    profile: "pontmore/swap@1".to_owned(),
+                    network: "regtest".to_owned(),
+                    operation: EconomicOperation::EscrowSecure,
+                    payload: json!({"inject_failure": "exit"}),
+                },
+            )
+            .await;
+        assert!(failed.is_err());
+        let health = manager
+            .health("pontmore/simulated-escrow")
+            .await
+            .expect("next exchange should start and handshake with a replacement process");
+        assert_eq!(health.status, ConnectorStatus::Succeeded);
         manager.shutdown().await;
     }
 }
