@@ -18,12 +18,14 @@ The executable slice provides:
 - stable machine-readable errors and language-neutral compatibility vectors;
 - a PostgreSQL-backed `pontmored` with immutable signed-event storage, rebuildable
   coordination projections, durable connector-operation records, and an SSE event log;
+- protocol-aware ingestion, automatic reconstruction, and idempotent execution of
+  eligible escrow effects;
 - static, digest-pinned, long-lived economic connector subprocesses; and
 - a `pontmore-tck` command that executes the compatibility vectors.
 
 Support is **experimental**. This slice does not yet provide relay synchronization,
-signing, automatic coordination reconstruction on event intake, descriptor discovery,
-real economic connectors, connector restart supervision, or OS-level connector
+signing or outcome publication, automatic descriptor discovery and service-schema
+validation, real economic connectors, scoped secret delivery, or OS-level connector
 sandboxing. Those omissions are hard implementation boundaries, not implied conformance.
 
 ### PIP-02 boundary
@@ -32,6 +34,11 @@ sandboxing. Those omissions are hard implementation boundaries, not implied conf
 a `DescriptorBinding`. The binding explicitly supplies PIP-01 currentness, lifetime,
 network, and service-authority facts established outside the reducer. It does not make
 an index or database record canonical protocol state.
+
+`pontmored` loads these facts from an explicit operator-reviewed `descriptor_bindings`
+registry in its static connector configuration. It rejects an otherwise valid root when
+the exact descriptor event is not registered; it never guesses currentness or authority
+from local event order.
 
 The reducer supports only PIP-02 content version 2 with the exact `pontmore/swap@1`
 profile. Fork recovery, private commitment verification, descriptor retrieval, and
@@ -86,6 +93,9 @@ The deliberately small HTTP surface is:
 Reconnect with `Last-Event-ID`; the daemon replays durable events strictly after that
 sequence. A connection without a cursor receives a transactionally consistent snapshot
 before live updates. Clients must still verify signed protocol events themselves.
+Connector-operation updates contain only operation ID, coordination ID, operation type,
+and status. Requests, responses, idempotency keys, connector identities, and errors
+remain private operator state.
 
 The API has no hosted authentication layer and defaults to loopback. A network
 deployment must put authenticated transport and authorization in front of it.
@@ -94,7 +104,8 @@ Daemon configuration uses one environment-variable namespace:
 
 - `PONTMORE_DATABASE_URL` is required;
 - `PONTMORE_LISTEN` defaults to `127.0.0.1:7300`;
-- `PONTMORE_CONNECTOR_CONFIG` selects the static connector allowlist; and
+- `PONTMORE_CONNECTOR_CONFIG` selects the static connector allowlist and descriptor
+  registry; and
 - `PONTMORE_CONNECTOR_TIMEOUT_MS` defaults to `30000`.
 
 ## Extensions and economic connectors
@@ -115,9 +126,22 @@ process. Profile, network, and connector type are checked before dispatch. Conne
 responses are operational evidence only; they cannot directly create canonical Pontmore
 state.
 
+Connector manifests also bind the protocol authority pubkeys they serve. A connector is
+eligible only when type, exact profile, network, and root-bound authority all match. A
+failed exchange discards the child; the next exchange starts and handshakes with a new
+process. Every execute command carries a deterministic idempotency key derived from the
+coordination, triggering signed action, and operation type so the connector can enforce
+deduplication independently of the daemon database.
+
 An operation interrupted while `running` becomes `ambiguous` on daemon startup and must
-be inspected before any retry. The connector execution methods are internal and have no
-HTTP route.
+be inspected before any retry. Startup performs that inspection before rebuilding stored
+coordinations. The connector execution methods are internal and have no HTTP route.
+
+For `pontmore/swap@1`, an applied `core/accept` creates an idempotent `escrow_secure`
+operation, `core/authorize_settlement` creates `escrow_settle`, and
+`core/authorize_refund` creates `escrow_refund`. Connector success does not synthesize
+or sign the corresponding public action; outcome signing and publication remain a
+separate future boundary.
 
 [`deploy/connectors.example.json`](deploy/connectors.example.json) enables the
 deterministic no-value simulated escrow connector. Relative paths are resolved from the
