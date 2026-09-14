@@ -1,7 +1,7 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nostr::event::Event;
-use pontmore::Reconstruction;
+use pontmore::{DescriptorBinding, Reconstruction};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -81,6 +81,15 @@ pub struct StreamSnapshot {
     pub connector_operations: Vec<PublicConnectorOperation>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkItem {
+    pub work_id: Uuid,
+    pub work_type: String,
+    pub payload: Value,
+    pub attempts: i32,
+    pub max_attempts: i32,
+}
+
 /// PostgreSQL-backed durable storage with separate protocol, projection,
 /// connector-operation, and client-stream state.
 #[derive(Clone)]
@@ -89,10 +98,6 @@ pub struct Store {
 }
 
 impl Store {
-    pub(crate) const fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     /// Connect to the durable database.
     ///
     /// # Errors
@@ -552,6 +557,271 @@ impl Store {
             .bind(health.healthy).bind(&health.error).execute(&self.pool).await?;
         Ok(())
     }
+
+    pub(crate) async fn events_of_kind(&self, kind: u16) -> Result<Vec<Event>, StoreError> {
+        let documents: Vec<Value> = sqlx::query_scalar(
+            "SELECT document FROM raw_events WHERE kind = $1 ORDER BY created_at, event_id",
+        )
+        .bind(i64::from(kind))
+        .fetch_all(&self.pool)
+        .await?;
+        documents
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) async fn put_schema_artifact(
+        &self,
+        artifact: &crate::schema::SchemaArtifact,
+        url: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO schema_artifacts (sha256, media_type, body, fetched_from) VALUES ($1, $2, $3, $4) ON CONFLICT (sha256) DO NOTHING")
+            .bind(&artifact.sha256)
+            .bind(&artifact.media_type)
+            .bind(&artifact.body)
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn put_descriptor_revision(
+        &self,
+        event: &Event,
+        binding: &DescriptorBinding,
+        d_tag: &str,
+        schema_type: Option<&str>,
+        schema_url: Option<&str>,
+        schema_sha256: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO descriptor_revisions (event_id, coordinate, pubkey, d_tag, created_at, expires_at, schema_type, schema_url, schema_sha256, schema_validated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (event_id) DO UPDATE SET schema_sha256 = EXCLUDED.schema_sha256, schema_validated = EXCLUDED.schema_validated")
+            .bind(event.id.to_hex())
+            .bind(&binding.coordinate)
+            .bind(event.pubkey.to_hex())
+            .bind(d_tag)
+            .bind(i64::try_from(binding.created_at).unwrap_or(i64::MAX))
+            .bind(i64::try_from(binding.expires_at).unwrap_or(i64::MAX))
+            .bind(schema_type)
+            .bind(schema_url)
+            .bind(schema_sha256)
+            .bind(schema_sha256.is_some())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn enqueue_publication(
+        &self,
+        event: &Event,
+        coordination_id: &str,
+        outcome: &str,
+    ) -> Result<(), StoreError> {
+        let document = serde_json::to_value(event)?;
+        let result = sqlx::query("INSERT INTO publication_outbox (event_id, coordination_id, outcome, document) VALUES ($1,$2,$3,$4) ON CONFLICT (event_id) DO NOTHING")
+            .bind(event.id.to_hex())
+            .bind(coordination_id)
+            .bind(outcome)
+            .bind(document)
+            .execute(&self.pool)
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(error))
+                if error.constraint() == Some("publication_terminal_outcome_idx") =>
+            {
+                Err(StoreError::TerminalOutcomeConflict)
+            }
+            Err(error) => Err(StoreError::Database(error)),
+        }
+    }
+
+    pub(crate) async fn next_publication(&self) -> Result<Option<Event>, StoreError> {
+        let document: Option<Value> = sqlx::query_scalar("UPDATE publication_outbox SET status = 'publishing', attempts = attempts + 1 WHERE event_id = (SELECT event_id FROM publication_outbox WHERE (status IN ('pending','published') OR (status = 'publishing' AND next_attempt_at < now() - interval '60 seconds')) AND next_attempt_at <= now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING document")
+            .fetch_optional(&self.pool)
+            .await?;
+        document
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) async fn mark_publication_sent(
+        &self,
+        event_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE publication_outbox SET status = CASE WHEN $2::text IS NULL THEN 'published' ELSE CASE WHEN attempts >= 12 THEN 'failed' ELSE 'pending' END END, published_at = CASE WHEN $2::text IS NULL THEN now() ELSE published_at END, last_error = $2, next_attempt_at = now() + make_interval(secs => LEAST(300, power(2, attempts))::double precision) WHERE event_id = $1")
+            .bind(event_id)
+            .bind(error)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn relay_since(
+        &self,
+        url: &str,
+        lookback: Duration,
+    ) -> Result<u64, StoreError> {
+        let checkpoint: Option<i64> = sqlx::query_scalar("SELECT last_event_created_at FROM relay_checkpoints WHERE relay_url = $1 AND backfill_complete")
+            .bind(url)
+            .fetch_optional(&self.pool)
+            .await?;
+        let fallback = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(lookback.as_secs());
+        Ok(checkpoint
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(fallback))
+    }
+
+    pub(crate) async fn mark_relay_backfilled(&self, url: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO relay_checkpoints (relay_url, backfill_complete, last_connected_at) VALUES ($1, true, now()) ON CONFLICT (relay_url) DO UPDATE SET backfill_complete = true, last_connected_at = now(), last_error = NULL, updated_at = now()")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn mark_relay_error(&self, url: &str, error: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO relay_checkpoints (relay_url, last_error) VALUES ($1, $2) ON CONFLICT (relay_url) DO UPDATE SET last_error = EXCLUDED.last_error, updated_at = now()")
+            .bind(url)
+            .bind(truncate(error, 4_096))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn advance_relay(&self, url: &str, created_at: u64) -> Result<(), StoreError> {
+        let created_at = i64::try_from(created_at).unwrap_or(i64::MAX);
+        sqlx::query("INSERT INTO relay_checkpoints (relay_url, last_event_created_at, backfill_complete, last_connected_at) VALUES ($1, $2, true, now()) ON CONFLICT (relay_url) DO UPDATE SET last_event_created_at = GREATEST(relay_checkpoints.last_event_created_at, EXCLUDED.last_event_created_at), last_connected_at = now(), last_error = NULL, updated_at = now()")
+            .bind(url)
+            .bind(created_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark an outbox event observed through relay ingestion.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn observe_publication(&self, event_id: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE publication_outbox SET status = 'observed', observed_at = now() WHERE event_id = $1 AND status IN ('pending', 'publishing', 'published')")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Check whether all required relays recently completed backfill.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn relay_readiness(&self, required: usize) -> Result<bool, StoreError> {
+        if required == 0 {
+            return Ok(true);
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_checkpoints WHERE backfill_complete AND last_connected_at > now() - interval '5 minutes'")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count >= i64::try_from(required).unwrap_or(i64::MAX))
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn enqueue_work(
+        &self,
+        work_type: &str,
+        idempotency_key: &str,
+        payload: &Value,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query("INSERT INTO work_queue (work_id, work_type, idempotency_key, payload) VALUES ($1, $2, $3, $4) ON CONFLICT (idempotency_key) DO UPDATE SET status = 'pending', attempts = 0, available_at = now(), lease_owner = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = now() WHERE work_queue.status IN ('completed', 'failed')")
+            .bind(Uuid::new_v4())
+            .bind(work_type)
+            .bind(idempotency_key)
+            .bind(payload)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn claim_work(
+        &self,
+        owner: Uuid,
+        lease: Duration,
+    ) -> Result<Option<WorkItem>, StoreError> {
+        let lease_seconds = i64::try_from(lease.as_secs()).unwrap_or(i64::MAX);
+        let row = sqlx::query("WITH candidate AS (SELECT work_id FROM work_queue WHERE ((status = 'pending' AND available_at <= now()) OR (status = 'leased' AND lease_expires_at < now())) AND (deadline_at IS NULL OR deadline_at > now()) ORDER BY available_at, created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE work_queue SET status = 'leased', lease_owner = $1, lease_expires_at = now() + make_interval(secs => $2::double precision), attempts = attempts + 1, updated_at = now() FROM candidate WHERE work_queue.work_id = candidate.work_id RETURNING work_queue.work_id, work_queue.work_type, work_queue.payload, work_queue.attempts, work_queue.max_attempts")
+            .bind(owner)
+            .bind(lease_seconds)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| -> Result<WorkItem, sqlx::Error> {
+            Ok(WorkItem {
+                work_id: row.try_get("work_id")?,
+                work_type: row.try_get("work_type")?,
+                payload: row.try_get("payload")?,
+                attempts: row.try_get("attempts")?,
+                max_attempts: row.try_get("max_attempts")?,
+            })
+        })
+        .transpose()
+        .map_err(StoreError::from)
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn complete_work(&self, work_id: Uuid, owner: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE work_queue SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE work_id = $1 AND lease_owner = $2 AND status = 'leased'")
+            .bind(work_id)
+            .bind(owner)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn retry_work(
+        &self,
+        item: &WorkItem,
+        owner: Uuid,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        let exhausted = item.attempts >= item.max_attempts;
+        let exponent = u32::try_from(item.attempts.clamp(1, 10)).unwrap_or(10);
+        let delay = 2_i64.pow(exponent).min(300);
+        sqlx::query("UPDATE work_queue SET status = $3, last_error = $4, lease_owner = NULL, lease_expires_at = NULL, available_at = now() + make_interval(secs => $5::double precision), updated_at = now() WHERE work_id = $1 AND lease_owner = $2")
+            .bind(item.work_id)
+            .bind(owner)
+            .bind(if exhausted { "failed" } else { "pending" })
+            .bind(truncate(error, 4_096))
+            .bind(delay)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn expire_work(&self) -> Result<u64, StoreError> {
+        let result = sqlx::query("UPDATE work_queue SET status = 'failed', last_error = 'work deadline elapsed', lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE status IN ('pending', 'leased') AND deadline_at <= now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+fn truncate(value: &str, limit: usize) -> &str {
+    value.get(..limit).unwrap_or(value)
 }
 
 async fn append_stream_event(

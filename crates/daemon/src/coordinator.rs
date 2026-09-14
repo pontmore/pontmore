@@ -838,66 +838,6 @@ fn redact_secret_echoes(value: &mut Value) {
     }
 }
 
-impl Store {
-    async fn events_of_kind(&self, kind: u16) -> Result<Vec<Event>, StoreError> {
-        let documents: Vec<Value> = sqlx::query_scalar(
-            "SELECT document FROM raw_events WHERE kind = $1 ORDER BY created_at, event_id",
-        )
-        .bind(i64::from(kind))
-        .fetch_all(self.pool())
-        .await?;
-        documents
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-    async fn enqueue_publication(
-        &self,
-        event: &Event,
-        coordination_id: &str,
-        outcome: &str,
-    ) -> Result<(), StoreError> {
-        let document = serde_json::to_value(event)?;
-        let result = sqlx::query("INSERT INTO publication_outbox (event_id, coordination_id, outcome, document) VALUES ($1,$2,$3,$4) ON CONFLICT (event_id) DO NOTHING")
-            .bind(event.id.to_hex()).bind(coordination_id).bind(outcome).bind(document).execute(self.pool()).await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(sqlx::Error::Database(error))
-                if error.constraint() == Some("publication_terminal_outcome_idx") =>
-            {
-                Err(StoreError::TerminalOutcomeConflict)
-            }
-            Err(error) => Err(StoreError::Database(error)),
-        }
-    }
-    async fn put_schema_artifact(
-        &self,
-        artifact: &crate::schema::SchemaArtifact,
-        url: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO schema_artifacts (sha256, media_type, body, fetched_from) VALUES ($1, $2, $3, $4) ON CONFLICT (sha256) DO NOTHING")
-            .bind(&artifact.sha256).bind(&artifact.media_type).bind(&artifact.body).bind(url).execute(self.pool()).await?;
-        Ok(())
-    }
-
-    async fn put_descriptor_revision(
-        &self,
-        event: &Event,
-        binding: &DescriptorBinding,
-        d_tag: &str,
-        schema_type: Option<&str>,
-        schema_url: Option<&str>,
-        schema_sha256: Option<&str>,
-    ) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO descriptor_revisions (event_id, coordinate, pubkey, d_tag, created_at, expires_at, schema_type, schema_url, schema_sha256, schema_validated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (event_id) DO UPDATE SET schema_sha256 = EXCLUDED.schema_sha256, schema_validated = EXCLUDED.schema_validated")
-            .bind(event.id.to_hex()).bind(&binding.coordinate).bind(event.pubkey.to_hex()).bind(d_tag)
-            .bind(i64::try_from(binding.created_at).unwrap_or(i64::MAX)).bind(i64::try_from(binding.expires_at).unwrap_or(i64::MAX))
-            .bind(schema_type).bind(schema_url).bind(schema_sha256).bind(schema_sha256.is_some()).execute(self.pool()).await?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct RootRouting {
     profile: String,

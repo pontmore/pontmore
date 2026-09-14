@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use nostr::event::Event;
@@ -191,82 +191,5 @@ const fn relay_priority(kind: u16) -> u8 {
         7_300 => 2,
         7_301 => 3,
         _ => 4,
-    }
-}
-
-impl Store {
-    async fn next_publication(&self) -> Result<Option<Event>, StoreError> {
-        let document: Option<serde_json::Value> = sqlx::query_scalar("UPDATE publication_outbox SET status = 'publishing', attempts = attempts + 1 WHERE event_id = (SELECT event_id FROM publication_outbox WHERE (status IN ('pending','published') OR (status = 'publishing' AND next_attempt_at < now() - interval '60 seconds')) AND next_attempt_at <= now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING document")
-            .fetch_optional(self.pool()).await?;
-        document
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(StoreError::from)
-    }
-
-    async fn mark_publication_sent(
-        &self,
-        event_id: &str,
-        error: Option<&str>,
-    ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE publication_outbox SET status = CASE WHEN $2::text IS NULL THEN 'published' ELSE CASE WHEN attempts >= 12 THEN 'failed' ELSE 'pending' END END, published_at = CASE WHEN $2::text IS NULL THEN now() ELSE published_at END, last_error = $2, next_attempt_at = now() + make_interval(secs => LEAST(300, power(2, attempts))::double precision) WHERE event_id = $1")
-            .bind(event_id).bind(error).execute(self.pool()).await?;
-        Ok(())
-    }
-
-    async fn relay_since(&self, url: &str, lookback: Duration) -> Result<u64, StoreError> {
-        let checkpoint: Option<i64> = sqlx::query_scalar("SELECT last_event_created_at FROM relay_checkpoints WHERE relay_url = $1 AND backfill_complete")
-        .bind(url).fetch_optional(self.pool())
-        .await?;
-        let fallback = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(lookback.as_secs());
-        Ok(checkpoint
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(fallback))
-    }
-
-    async fn mark_relay_backfilled(&self, url: &str) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO relay_checkpoints (relay_url, backfill_complete, last_connected_at) VALUES ($1, true, now()) ON CONFLICT (relay_url) DO UPDATE SET backfill_complete = true, last_connected_at = now(), last_error = NULL, updated_at = now()")
-            .bind(url).execute(self.pool()).await?;
-        Ok(())
-    }
-
-    async fn mark_relay_error(&self, url: &str, error: &str) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO relay_checkpoints (relay_url, last_error) VALUES ($1, $2) ON CONFLICT (relay_url) DO UPDATE SET last_error = EXCLUDED.last_error, updated_at = now()")
-            .bind(url).bind(error.get(..4_096).unwrap_or(error)).execute(self.pool()).await?;
-        Ok(())
-    }
-
-    async fn advance_relay(&self, url: &str, created_at: u64) -> Result<(), StoreError> {
-        let created_at = i64::try_from(created_at).unwrap_or(i64::MAX);
-        sqlx::query("INSERT INTO relay_checkpoints (relay_url, last_event_created_at, backfill_complete, last_connected_at) VALUES ($1, $2, true, now()) ON CONFLICT (relay_url) DO UPDATE SET last_event_created_at = GREATEST(relay_checkpoints.last_event_created_at, EXCLUDED.last_event_created_at), last_connected_at = now(), last_error = NULL, updated_at = now()")
-            .bind(url).bind(created_at).execute(self.pool()).await?;
-        Ok(())
-    }
-
-    /// Mark an outbox event observed through relay ingestion.
-    ///
-    /// # Errors
-    /// Returns a storage error.
-    pub async fn observe_publication(&self, event_id: &str) -> Result<(), StoreError> {
-        sqlx::query("UPDATE publication_outbox SET status = 'observed', observed_at = now() WHERE event_id = $1 AND status IN ('pending', 'publishing', 'published')")
-            .bind(event_id).execute(self.pool()).await?;
-        Ok(())
-    }
-
-    /// Check whether all required relays recently completed backfill.
-    ///
-    /// # Errors
-    /// Returns a storage error.
-    pub async fn relay_readiness(&self, required: usize) -> Result<bool, StoreError> {
-        if required == 0 {
-            return Ok(true);
-        }
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_checkpoints WHERE backfill_complete AND last_connected_at > now() - interval '5 minutes'")
-            .fetch_one(self.pool()).await?;
-        Ok(count >= i64::try_from(required).unwrap_or(i64::MAX))
     }
 }
