@@ -1,0 +1,11 @@
+{
+  "id": "pontmore/simulated-escrow",
+  "package_version": "0.1.0",
+  "connector_api_version": 1,
+  "connector_type": "escrow",
+  "supported_profiles": ["pontmore/swap@1"],
+  "supported_networks": ["regtest"],
+  "entrypoint": "simulated-escrow.py",
+  "entrypoint_sha256": "6a6a49e16b5093f08ba7dcdb3a04e93932fdac838e62a3caeaadbd6e543ff2e7",
+  "source": "https://github.com/pontmore/pontmore/tree/main/examples/connectors/simulated-escrow"
+}

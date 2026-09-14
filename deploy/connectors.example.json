@@ -1,0 +1,8 @@
+{
+  "connectors": {
+    "pontmore/simulated-escrow": {
+      "manifest": "../examples/connectors/simulated-escrow/manifest.json",
+      "enabled": true
+    }
+  }
+}

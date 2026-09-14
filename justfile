@@ -27,5 +27,9 @@ test:
 tck:
     cargo run --locked -p pontmore-tck -- tck/vectors
 
+# Start pontmored; PONTMORE_DATABASE_URL is required.
+daemon *args:
+    cargo run --locked -p pontmored -- {{ args }}
+
 # Run every non-mutating repository check.
 check: format-check lint test tck

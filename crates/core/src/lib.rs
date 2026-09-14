@@ -1,8 +1,7 @@
 //! Deterministic validation for Pontmore public protocol objects.
 //!
-//! The crate currently validates PIP-00 and PIP-01 content and indexing tags.
-//! Nostr envelope verification and PIP-02 reconstruction are deliberately not
-//! represented as implemented until they have executable compatibility vectors.
+//! The crate validates PIP-00 and PIP-01 content and indexing tags, verifies signed
+//! PIP-02 events, and reconstructs `pontmore/swap@1` coordination chains.
 
 use std::collections::BTreeSet;
 
