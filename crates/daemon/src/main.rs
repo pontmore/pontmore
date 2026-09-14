@@ -1,7 +1,9 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use pontmored::{AppState, Config, ConnectorManager, Store, router};
+use pontmored::{
+    AppState, Config, ConnectorManager, Coordinator, DescriptorRegistry, Store, router,
+};
 use tokio::{net::TcpListener, sync::broadcast};
 use tracing_subscriber::EnvFilter;
 
@@ -38,14 +40,23 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.connector_timeout(),
     )
     .await?;
+    let descriptors = DescriptorRegistry::load(config.connector_config.as_deref()).await?;
     let (stream_sender, _) = broadcast::channel(1_024);
+    let coordinator = Coordinator::new(
+        store.clone(),
+        connectors.clone(),
+        descriptors,
+        stream_sender.clone(),
+    );
+    coordinator.reconcile_ambiguous().await?;
+    coordinator.rebuild_all().await?;
     let listener = TcpListener::bind(config.listen).await?;
     tracing::info!(address = %config.listen, connectors = connectors.manifests().len(), "pontmored listening");
     axum::serve(
         listener,
         router(AppState {
             store,
-            connectors: connectors.clone(),
+            coordinator,
             stream_sender,
         }),
     )

@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    connector::ConnectorManager,
+    coordinator::{Coordinator, CoordinatorError, ProtocolFailure},
     store::{InsertOutcome, Store, StoreError, StreamEvent},
 };
 
@@ -23,7 +23,7 @@ const STREAM_PAGE_SIZE: i64 = 1_000;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub connectors: ConnectorManager,
+    pub coordinator: Coordinator,
     pub stream_sender: broadcast::Sender<StreamEvent>,
 }
 
@@ -60,16 +60,12 @@ async fn put_event(
     State(state): State<AppState>,
     Json(input): Json<EventSubmission>,
 ) -> Result<StatusCode, ApiError> {
-    input.event.verify().map_err(|error| {
-        ApiError::bad_request(
-            "INVALID_EVENT",
-            format!("event verification failed: {error}"),
-        )
-    })?;
+    state.coordinator.validate_for_ingest(&input.event)?;
     let (outcome, stream_event) = state.store.put_event(&input.event).await?;
     if let Some(stream_event) = stream_event {
         let _ = state.stream_sender.send(stream_event);
     }
+    state.coordinator.process_event(&input.event).await?;
     let status = if outcome == InsertOutcome::Inserted {
         StatusCode::ACCEPTED
     } else {
@@ -89,7 +85,6 @@ async fn stream(
     } else {
         None
     };
-    let connectors = state.connectors.manifests();
     let mut cursor =
         supplied_cursor.unwrap_or_else(|| initial.as_ref().map_or(0, |snapshot| snapshot.cursor));
     let store = state.store;
@@ -99,7 +94,6 @@ async fn stream(
             let data = json!({
                 "coordinations": snapshot.coordinations,
                 "connector_operations": snapshot.connector_operations,
-                "connectors": connectors,
             });
             yield Ok::<_, Infallible>(sse_event(snapshot.cursor, "snapshot", &data));
         }
@@ -173,8 +167,10 @@ fn sse_event(sequence: i64, event_type: &str, data: &Value) -> SseEvent {
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
-    code: &'static str,
+    code: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Vec<ProtocolFailure>>,
 }
 
 #[derive(Debug)]
@@ -188,8 +184,9 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorBody {
-                code,
+                code: code.to_owned(),
                 message: message.into(),
+                details: None,
             },
         }
     }
@@ -201,15 +198,44 @@ impl From<StoreError> for ApiError {
             StoreError::EventCollision | StoreError::IdempotencyConflict => Self {
                 status: StatusCode::CONFLICT,
                 body: ErrorBody {
-                    code: "CONFLICT",
+                    code: "CONFLICT".to_owned(),
                     message: error.to_string(),
+                    details: None,
                 },
             },
             StoreError::Database(_) | StoreError::Migration(_) | StoreError::Json(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: ErrorBody {
-                    code: "STORAGE_ERROR",
+                    code: "STORAGE_ERROR".to_owned(),
                     message: "storage operation failed".to_owned(),
+                    details: None,
+                },
+            },
+        }
+    }
+}
+
+impl From<CoordinatorError> for ApiError {
+    fn from(error: CoordinatorError) -> Self {
+        match error {
+            CoordinatorError::Protocol(details) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                body: ErrorBody {
+                    code: "PROTOCOL_VALIDATION_FAILED".to_owned(),
+                    message: "event is not valid for a supported Pontmore profile".to_owned(),
+                    details: Some(details),
+                },
+            },
+            CoordinatorError::Store(error) => error.into(),
+            CoordinatorError::DescriptorConfiguration(_)
+            | CoordinatorError::Connector(_)
+            | CoordinatorError::Io(_)
+            | CoordinatorError::Json(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: ErrorBody {
+                    code: "COORDINATION_ERROR".to_owned(),
+                    message: "coordination processing failed".to_owned(),
+                    details: None,
                 },
             },
         }

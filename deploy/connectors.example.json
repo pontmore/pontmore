@@ -4,5 +4,23 @@
       "manifest": "../examples/connectors/simulated-escrow/manifest.json",
       "enabled": true
     }
+  },
+  "descriptor_bindings": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+      "event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "coordinate": "30361:2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4:cashu-main",
+      "created_at": 90,
+      "selectable_at_root": true,
+      "current_at_acceptance": true,
+      "expires_at": 1000,
+      "networks": ["cashu"],
+      "authorities_validated": true,
+      "supported_resolution_effects": [
+        "resume",
+        "authorize_settlement",
+        "authorize_refund",
+        "cancel"
+      ]
+    }
   }
 }

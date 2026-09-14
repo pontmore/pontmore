@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::Parser;
+use pontmore::DescriptorBinding;
 use serde::{Deserialize, Serialize};
 
 /// Command-line and environment configuration.
@@ -37,6 +38,9 @@ impl Config {
 pub struct ConnectorConfig {
     #[serde(default)]
     pub connectors: BTreeMap<String, ConnectorRegistration>,
+    /// Operator-established PIP-01 facts that cannot be inferred from local event order.
+    #[serde(default)]
+    pub descriptor_bindings: BTreeMap<String, DescriptorBinding>,
 }
 
 /// One explicitly configured connector manifest.
