@@ -24,7 +24,10 @@
       "input": {
         "type": "agent_definition",
         "content": { "version": 1, "capabilities": [] },
-        "tags": [["d", "agent"], ["t", "agent"]]
+        "tags": [
+          ["d", "agent"],
+          ["t", "agent"]
+        ]
       },
       "expected": { "valid": false, "error_codes": ["EMPTY_CAPABILITIES"] }
     },
@@ -100,4 +103,3 @@
     }
   ]
 }
-

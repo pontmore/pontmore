@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pontmore-core = { path = "../pontmore-core" }
+pontmore = { path = "../core" }
 nostr.workspace = true
 serde.workspace = true
 serde_json.workspace = true

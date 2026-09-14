@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "crates/pontmore-core",
-    "crates/pontmore-tck",
-]
+members = ["crates/core", "crates/tck"]
 resolver = "2"
 
 [workspace.package]

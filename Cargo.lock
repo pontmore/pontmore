@@ -482,7 +482,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pontmore-core"
+name = "pontmore"
 version = "0.1.0"
 dependencies = [
  "nostr",
@@ -496,7 +496,7 @@ name = "pontmore-tck"
 version = "0.1.0"
 dependencies = [
  "nostr",
- "pontmore-core",
+ "pontmore",
  "serde",
  "serde_json",
 ]

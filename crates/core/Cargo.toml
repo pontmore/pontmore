@@ -1,5 +1,5 @@
 [package]
-name = "pontmore-core"
+name = "pontmore"
 description = "Deterministic validation and reconstruction for the Pontmore protocol"
 version.workspace = true
 edition.workspace = true

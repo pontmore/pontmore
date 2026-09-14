@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use pontmore_core::{
+use pontmore::{
     CoordinationState, DescriptorBinding, DescriptorSelection, ErrorCode, Tag,
     validate_agent_definition, validate_escrow_descriptor, validate_swap_coordination,
 };
