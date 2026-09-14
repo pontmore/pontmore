@@ -20,13 +20,17 @@ The executable slice provides:
   coordination projections, durable connector-operation records, and an SSE event log;
 - protocol-aware ingestion, automatic reconstruction, and idempotent execution of
   eligible escrow effects;
-- static, digest-pinned, long-lived economic connector subprocesses; and
+- durable leased work with multi-daemon `SKIP LOCKED` coordination and backoff;
+- relay backfill/subscription/publication for kinds 30360, 30361, 7300, and 7301;
+- safe, digest-pinned service-schema resolution with reviewed authority facts;
+- validated signed outcomes with a reconciliation-capable publication outbox;
+- static, digest-pinned, supervised long-lived economic connector subprocesses; and
 - a `pontmore-tck` command that executes the compatibility vectors.
 
-Support is **experimental**. This slice does not yet provide relay synchronization,
-signing or outcome publication, automatic descriptor discovery and service-schema
-validation, real economic connectors, scoped secret delivery, or OS-level connector
-sandboxing. Those omissions are hard implementation boundaries, not implied conformance.
+Support is **experimental**. A deployment must still supply authenticated ingress, an OS
+sandbox launcher, reviewed schema policies, an isolated outcome-signing connector,
+durable connector-side idempotency, and real economic connectors. The included connector
+moves no value and does not sign outcomes.
 
 ### PIP-02 boundary
 
@@ -35,10 +39,11 @@ a `DescriptorBinding`. The binding explicitly supplies PIP-01 currentness, lifet
 network, and service-authority facts established outside the reducer. It does not make
 an index or database record canonical protocol state.
 
-`pontmored` loads these facts from an explicit operator-reviewed `descriptor_bindings`
-registry in its static connector configuration. It rejects an otherwise valid root when
-the exact descriptor event is not registered; it never guesses currentness or authority
-from local event order.
+`pontmored` resolves descriptors from configured relays, applies NIP-01 addressable
+revision ordering at root and acceptance time, safely fetches service schemas, and pins
+the artifact digest. Because PIP-01 delegates authority semantics to the schema, a local
+`schema_policies` entry approves the digest, authority keys, and resolution effects.
+Static `descriptor_bindings` remain an explicit offline/test fallback.
 
 The reducer supports only PIP-02 content version 2 with the exact `pontmore/swap@1`
 profile. Fork recovery, private commitment verification, descriptor retrieval, and
@@ -92,7 +97,9 @@ The deliberately small HTTP surface is:
 `GET /health/live` and `GET /health/ready` are operational probes, not client data APIs.
 Reconnect with `Last-Event-ID`; the daemon replays durable events strictly after that
 sequence. A connection without a cursor receives a transactionally consistent snapshot
-before live updates. Clients must still verify signed protocol events themselves.
+before live updates. Snapshots carry `schema_version: 1`. Expired cursors return `410`;
+oversized replays return `409`; slow consumers receive a terminal `stream_error` and
+must reconnect for a snapshot. Clients must still verify signed protocol events.
 Connector-operation updates contain only operation ID, coordination ID, operation type,
 and status. Requests, responses, idempotency keys, connector identities, and errors
 remain private operator state.
@@ -106,7 +113,14 @@ Daemon configuration uses one environment-variable namespace:
 - `PONTMORE_LISTEN` defaults to `127.0.0.1:7300`;
 - `PONTMORE_CONNECTOR_CONFIG` selects the static connector allowlist and descriptor
   registry; and
-- `PONTMORE_CONNECTOR_TIMEOUT_MS` defaults to `30000`.
+- `PONTMORE_CONNECTOR_TIMEOUT_MS` defaults to `30000`;
+- `PONTMORE_RELAYS` is a comma-separated relay allowlist;
+- `PONTMORE_RELAY_LOOKBACK_SECS` defaults to seven days;
+- `PONTMORE_SCHEMA_MAX_BYTES` defaults to 2 MiB;
+- `PONTMORE_WORK_LEASE_SECS` defaults to 60 and must exceed connector timeout;
+- `PONTMORE_STREAM_MAX_REPLAY` defaults to 10,000 records;
+- `PONTMORE_STREAM_RETENTION_SECS` defaults to seven days; and
+- `PONTMORE_REQUIRE_CONNECTOR_SANDBOX=true` refuses unsandboxed connectors.
 
 ## Extensions and economic connectors
 
@@ -122,31 +136,39 @@ Economic connectors are a separate internal boundary for narrowly typed effects 
 daemon reads a static allowlist, verifies each executable digest and manifest, starts
 one long-lived subprocess, clears its environment, and performs a versioned handshake.
 Subsequent `health`, `execute`, `inspect`, and `shutdown` JSON Lines commands reuse that
-process. Profile, network, and connector type are checked before dispatch. Connector
-responses are operational evidence only; they cannot directly create canonical Pontmore
-state.
+process. Profile, network, connector type, value policy, and bound authority are checked
+before dispatch. Connector success is only operational evidence. An outcome changes
+protocol state only when the connector returns a signed action whose signature, signer,
+root, predecessor, action, graph, and authority validate, and that event is published,
+observed from a relay, ingested, and reconstructed.
 
 Connector manifests also bind the protocol authority pubkeys they serve. A connector is
 eligible only when type, exact profile, network, and root-bound authority all match. A
-failed exchange discards the child; the next exchange starts and handshakes with a new
-process. Every execute command carries a deterministic idempotency key derived from the
-coordination, triggering signed action, and operation type so the connector can enforce
-deduplication independently of the daemon database.
+failed exchange discards the child; bounded backoff and a restart budget govern its
+replacement. Periodic health and connector version/digest are durable. Every execute
+command carries a deterministic idempotency key derived from the coordination,
+triggering signed action, and operation type so the connector can enforce deduplication
+independently of the daemon database.
+
+Secrets are read from owner-restricted files only for manifest-declared operations and
+sent through the private subprocess channel, never inherited through the environment or
+included in durable requests/SSE. Connector stderr is bounded structured diagnostic
+output. A configured sandbox launcher owns OS identity, resource, filesystem, syscall,
+and network enforcement; production can require it fail closed.
 
 An operation interrupted while `running` becomes `ambiguous` on daemon startup and must
 be inspected before any retry. Startup performs that inspection before rebuilding stored
 coordinations. The connector execution methods are internal and have no HTTP route.
 
 For `pontmore/swap@1`, an applied `core/accept` creates an idempotent `escrow_secure`
-operation, `core/authorize_settlement` creates `escrow_settle`, and
-`core/authorize_refund` creates `escrow_refund`. Connector success does not synthesize
-or sign the corresponding public action; outcome signing and publication remain a
-separate future boundary.
+operation, `core/authorize_settlement` creates `escrow_settle`, `core/authorize_refund`
+creates `escrow_refund`, and `core/open_dispute` can dispatch a resolver. The daemon
+never synthesizes an authority signature.
 
 [`deploy/connectors.example.json`](deploy/connectors.example.json) enables the
 deterministic no-value simulated escrow connector. Relative paths are resolved from the
-configuration and manifest files. Until OS sandboxing is added, operators must treat
-configured executables as trusted code.
+configuration and manifest files. It is intentionally unsandboxed for portability. Read
+[`docs/operations.md`](docs/operations.md) before enabling a value-bearing connector.
 
 ## Design rules
 
