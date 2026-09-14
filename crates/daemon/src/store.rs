@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use nostr::event::Event;
 use pontmore::{DescriptorBinding, Reconstruction};
@@ -90,6 +93,98 @@ pub struct WorkItem {
     pub max_attempts: i32,
 }
 
+/// Authenticated operator view of daemon persistence state.
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorDashboard {
+    pub generated_at: u64,
+    pub event_count: i64,
+    pub stream_cursor: i64,
+    pub execution_enabled: bool,
+    pub coordination_count: i64,
+    pub coordinations: Vec<OperatorCoordination>,
+    pub work: BTreeMap<String, i64>,
+    pub operations: BTreeMap<String, i64>,
+    pub publications: BTreeMap<String, i64>,
+    pub relays: Vec<OperatorRelay>,
+    pub connectors: Vec<OperatorConnector>,
+    pub recent_events: Vec<OperatorEvent>,
+    pub recent_work: Vec<OperatorWork>,
+    pub recent_operations: Vec<OperatorOperation>,
+    pub recent_publications: Vec<OperatorPublication>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorEvent {
+    pub event_id: String,
+    pub pubkey: String,
+    pub kind: i64,
+    pub created_at: i64,
+    pub received_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorWork {
+    pub work_id: Uuid,
+    pub work_type: String,
+    pub status: String,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub updated_at: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorOperation {
+    pub operation_id: Uuid,
+    pub connector_id: String,
+    pub coordination_id: Option<String>,
+    pub operation: Option<String>,
+    pub status: String,
+    pub updated_at: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorPublication {
+    pub event_id: String,
+    pub coordination_id: String,
+    pub outcome: String,
+    pub status: String,
+    pub attempts: i32,
+    pub created_at: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorCoordination {
+    pub coordination_id: String,
+    pub state: String,
+    pub tip_event_id: String,
+    pub applied_count: i64,
+    pub rejection_count: i64,
+    pub forked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorRelay {
+    pub relay_url: String,
+    pub backfill_complete: bool,
+    pub last_event_created_at: i64,
+    pub last_connected_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorConnector {
+    pub connector_id: String,
+    pub package_version: String,
+    pub status: String,
+    pub consecutive_failures: i32,
+    pub restart_count: i32,
+    pub last_ok_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 /// PostgreSQL-backed durable storage with separate protocol, projection,
 /// connector-operation, and client-stream state.
 #[derive(Clone)]
@@ -139,6 +234,34 @@ impl Store {
     pub async fn activate_execution(&self) -> Result<(), StoreError> {
         sqlx::query("UPDATE daemon_state SET value = to_jsonb(now()), updated_at = now() WHERE key = 'execution_activation_cursor' AND value = 'null'::jsonb")
             .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Whether automatic economic connector dispatch is enabled by the operator.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn execution_enabled(&self) -> Result<bool, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE((value #>> '{}')::boolean, false) FROM daemon_state WHERE key = 'economic_execution_enabled'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false))
+    }
+
+    /// Persist the operator's economic execution switch.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn set_execution_enabled(&self, enabled: bool) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO daemon_state (key, value) VALUES ('economic_execution_enabled', to_jsonb($1::boolean)) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        )
+        .bind(enabled)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -818,6 +941,248 @@ impl Store {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// Requeue failed work that has not passed its deadline.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn retry_failed_work(&self) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE work_queue SET status = 'pending', attempts = 0, available_at = now(), \
+             lease_owner = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = now() \
+             WHERE status = 'failed' AND (deadline_at IS NULL OR deadline_at > now())",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Requeue failed signed-event publications.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn retry_failed_publications(&self) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE publication_outbox SET status = 'pending', attempts = 0, \
+             next_attempt_at = now(), last_error = NULL WHERE status = 'failed'",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Build the private operational snapshot rendered by the built-in UI.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn operator_dashboard(&self) -> Result<OperatorDashboard, StoreError> {
+        let event_count = sqlx::query_scalar("SELECT COUNT(*) FROM raw_events")
+            .fetch_one(&self.pool)
+            .await?;
+        let stream_cursor =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM stream_events")
+                .fetch_one(&self.pool)
+                .await?;
+        let coordination_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM coordination_projections")
+                .fetch_one(&self.pool)
+                .await?;
+
+        let coordination_rows = sqlx::query(
+            "SELECT coordination_id, state, tip_event_id, \
+             jsonb_array_length(COALESCE(document->'applied', '[]'::jsonb))::bigint AS applied_count, \
+             jsonb_array_length(COALESCE(document->'rejections', '[]'::jsonb))::bigint AS rejection_count, \
+             COALESCE(document->'fork' <> 'null'::jsonb, false) AS forked \
+             FROM coordination_projections ORDER BY rebuilt_at DESC, coordination_id LIMIT 200",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let coordinations = coordination_rows
+            .iter()
+            .map(|row| {
+                Ok(OperatorCoordination {
+                    coordination_id: row.try_get("coordination_id")?,
+                    state: row.try_get("state")?,
+                    tip_event_id: row.try_get("tip_event_id")?,
+                    applied_count: row.try_get("applied_count")?,
+                    rejection_count: row.try_get("rejection_count")?,
+                    forked: row.try_get("forked")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let relay_rows = sqlx::query(
+            "SELECT relay_url, backfill_complete, last_event_created_at, \
+             EXTRACT(EPOCH FROM last_connected_at)::bigint AS last_connected_at, last_error \
+             FROM relay_checkpoints ORDER BY relay_url LIMIT 200",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let relays = relay_rows
+            .iter()
+            .map(|row| {
+                Ok(OperatorRelay {
+                    relay_url: row.try_get("relay_url")?,
+                    backfill_complete: row.try_get("backfill_complete")?,
+                    last_event_created_at: row.try_get("last_event_created_at")?,
+                    last_connected_at: row.try_get("last_connected_at")?,
+                    last_error: row.try_get("last_error")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let connector_rows = sqlx::query(
+            "SELECT connector_id, package_version, status, consecutive_failures, restart_count, \
+             EXTRACT(EPOCH FROM last_ok_at)::bigint AS last_ok_at, last_error \
+             FROM connector_health ORDER BY connector_id LIMIT 200",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let connectors = connector_rows
+            .iter()
+            .map(|row| {
+                Ok(OperatorConnector {
+                    connector_id: row.try_get("connector_id")?,
+                    package_version: row.try_get("package_version")?,
+                    status: row.try_get("status")?,
+                    consecutive_failures: row.try_get("consecutive_failures")?,
+                    restart_count: row.try_get("restart_count")?,
+                    last_ok_at: row.try_get("last_ok_at")?,
+                    last_error: row.try_get("last_error")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        Ok(OperatorDashboard {
+            generated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            event_count,
+            stream_cursor,
+            execution_enabled: self.execution_enabled().await?,
+            coordination_count,
+            coordinations,
+            work: status_counts(&self.pool, "work_queue").await?,
+            operations: status_counts(&self.pool, "connector_operations").await?,
+            publications: status_counts(&self.pool, "publication_outbox").await?,
+            relays,
+            connectors,
+            recent_events: operator_events(&self.pool).await?,
+            recent_work: operator_work(&self.pool).await?,
+            recent_operations: operator_operations(&self.pool).await?,
+            recent_publications: operator_publications(&self.pool).await?,
+        })
+    }
+}
+
+async fn status_counts(pool: &PgPool, table: &str) -> Result<BTreeMap<String, i64>, sqlx::Error> {
+    let statement = match table {
+        "work_queue" => "SELECT status, COUNT(*)::bigint AS count FROM work_queue GROUP BY status",
+        "connector_operations" => {
+            "SELECT status, COUNT(*)::bigint AS count FROM connector_operations GROUP BY status"
+        }
+        "publication_outbox" => {
+            "SELECT status, COUNT(*)::bigint AS count FROM publication_outbox GROUP BY status"
+        }
+        _ => unreachable!("status count table is selected internally"),
+    };
+    sqlx::query(statement)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| Ok((row.try_get("status")?, row.try_get("count")?)))
+        .collect()
+}
+
+async fn operator_events(pool: &PgPool) -> Result<Vec<OperatorEvent>, sqlx::Error> {
+    sqlx::query(
+        "SELECT event_id, pubkey, kind, created_at, \
+         EXTRACT(EPOCH FROM received_at)::bigint AS received_at \
+         FROM raw_events ORDER BY received_at DESC, event_id LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|row| {
+        Ok(OperatorEvent {
+            event_id: row.try_get("event_id")?,
+            pubkey: row.try_get("pubkey")?,
+            kind: row.try_get("kind")?,
+            created_at: row.try_get("created_at")?,
+            received_at: row.try_get("received_at")?,
+        })
+    })
+    .collect()
+}
+
+async fn operator_work(pool: &PgPool) -> Result<Vec<OperatorWork>, sqlx::Error> {
+    sqlx::query(
+        "SELECT work_id, work_type, status, attempts, max_attempts, last_error, \
+         EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at \
+         FROM work_queue ORDER BY updated_at DESC, work_id LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|row| {
+        Ok(OperatorWork {
+            work_id: row.try_get("work_id")?,
+            work_type: row.try_get("work_type")?,
+            status: row.try_get("status")?,
+            attempts: row.try_get("attempts")?,
+            max_attempts: row.try_get("max_attempts")?,
+            updated_at: row.try_get("updated_at")?,
+            last_error: row.try_get("last_error")?,
+        })
+    })
+    .collect()
+}
+
+async fn operator_operations(pool: &PgPool) -> Result<Vec<OperatorOperation>, sqlx::Error> {
+    sqlx::query(
+        "SELECT operation_id, connector_id, coordination_id, operation_type, status, error, \
+         EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at \
+         FROM connector_operations ORDER BY updated_at DESC, operation_id LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|row| {
+        Ok(OperatorOperation {
+            operation_id: row.try_get("operation_id")?,
+            connector_id: row.try_get("connector_id")?,
+            coordination_id: row.try_get("coordination_id")?,
+            operation: row.try_get("operation_type")?,
+            status: row.try_get("status")?,
+            updated_at: row.try_get("updated_at")?,
+            error: row.try_get("error")?,
+        })
+    })
+    .collect()
+}
+
+async fn operator_publications(pool: &PgPool) -> Result<Vec<OperatorPublication>, sqlx::Error> {
+    sqlx::query(
+        "SELECT event_id, coordination_id, outcome, status, attempts, last_error, \
+         EXTRACT(EPOCH FROM created_at)::bigint AS created_at \
+         FROM publication_outbox ORDER BY created_at DESC, event_id LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|row| {
+        Ok(OperatorPublication {
+            event_id: row.try_get("event_id")?,
+            coordination_id: row.try_get("coordination_id")?,
+            outcome: row.try_get("outcome")?,
+            status: row.try_get("status")?,
+            attempts: row.try_get("attempts")?,
+            created_at: row.try_get("created_at")?,
+            last_error: row.try_get("last_error")?,
+        })
+    })
+    .collect()
 }
 
 fn truncate(value: &str, limit: usize) -> &str {

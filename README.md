@@ -24,7 +24,8 @@ The executable slice provides:
 - relay backfill/subscription/publication for kinds 30360, 30361, 7300, and 7301;
 - safe, digest-pinned service-schema resolution with reviewed authority facts;
 - validated signed outcomes with a reconciliation-capable publication outbox;
-- static, digest-pinned, supervised long-lived economic connector subprocesses; and
+- static, digest-pinned, supervised long-lived economic connector subprocesses;
+- an embedded, server-rendered operator dashboard on a separate private listener; and
 - a `pontmore-tck` command that executes the compatibility vectors.
 
 Support is **experimental**. A deployment must still supply authenticated ingress, an OS
@@ -74,9 +75,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## `pontmored`
 
-The daemon defaults to `127.0.0.1:7300`. It verifies every signed event before durable
-storage. Public signed events remain canonical; projections, stream cursors, connector
-operations, and private database records are implementation overlays.
+The client API defaults to `127.0.0.1:7300`. It verifies every signed event before
+durable storage. Public signed events remain canonical; projections, stream cursors,
+connector operations, and private database records are implementation overlays.
 
 Start a local node with:
 
@@ -107,10 +108,43 @@ remain private operator state.
 The API has no hosted authentication layer and defaults to loopback. A network
 deployment must put authenticated transport and authorization in front of it.
 
+The built-in operator UI is a separate implementation overlay at
+`http://127.0.0.1:7301`. It is server-rendered by `pontmored`, uses an authenticated SSE
+connection for live status, and embeds its CSS and JavaScript in the daemon binary. It
+does not add client protocol routes. The operator console reports event, coordination,
+work, publication, relay, and connector health state. It can submit complete signed
+events, pause or resume new economic execution, queue projection rebuilds, retry failed
+work and publications, probe connectors, and gracefully stop the daemon. These are
+authenticated operator actions on implementation state, not Pontmore protocol messages.
+
+Listeners, relay URLs, connector manifests, secret paths, and sandbox launchers remain
+startup-managed. The Configuration page shows their effective non-secret values and
+identifies them as requiring a restart. The only mutable runtime policy is the durable
+economic-execution switch. Pausing prevents new dispatch but does not cancel an
+already-running connector operation; resuming queues all coordinations for idempotent
+re-evaluation.
+
+Loopback operation is passwordless by default. To require sign-in, write a password to
+an owner-only file and pass `PONTMORE_UI_PASSWORD_FILE`. Sessions use signed, expiring,
+HTTP-only, same-site cookies; session signing keys are ephemeral and daemon restarts log
+operators out.
+
+```console
+install -d -m 0700 .pontmore
+install -m 0600 /dev/stdin .pontmore/ui-password <<<'replace-this-password'
+PONTMORE_UI_PASSWORD_FILE=.pontmore/ui-password \
+  cargo run -p pontmored -- --database-url postgres://localhost/pontmore
+```
+
 Daemon configuration uses one environment-variable namespace:
 
 - `PONTMORE_DATABASE_URL` is required;
 - `PONTMORE_LISTEN` defaults to `127.0.0.1:7300`;
+- `PONTMORE_UI_ENABLED` defaults to `true`;
+- `PONTMORE_UI_LISTEN` defaults to `127.0.0.1:7301`;
+- `PONTMORE_UI_PASSWORD_FILE` optionally selects an owner-only password file;
+- `PONTMORE_UI_SESSION_TTL_SECS` defaults to eight hours;
+- `PONTMORE_UI_SECURE_COOKIES` defaults to `false` for local HTTP;
 - `PONTMORE_CONNECTOR_CONFIG` selects the static connector allowlist and descriptor
   registry; and
 - `PONTMORE_CONNECTOR_TIMEOUT_MS` defaults to `30000`;

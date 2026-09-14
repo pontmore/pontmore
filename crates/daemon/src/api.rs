@@ -10,7 +10,7 @@ use axum::{
 use nostr::event::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tower_http::trace::TraceLayer;
 
 use crate::{
@@ -25,6 +25,7 @@ pub struct AppState {
     pub store: Store,
     pub coordinator: Coordinator,
     pub stream_sender: broadcast::Sender<StreamEvent>,
+    pub shutdown: watch::Receiver<bool>,
     pub max_replay: i64,
     pub required_relays: usize,
 }
@@ -106,6 +107,7 @@ async fn stream(
         }
     }
     let mut receiver = state.stream_sender.subscribe();
+    let mut shutdown = state.shutdown;
     let initial = if supplied_cursor.is_none() {
         Some(state.store.stream_snapshot().await?)
     } else {
@@ -157,15 +159,18 @@ async fn stream(
                 }
             }
 
-            match receiver.recv().await {
-                Ok(item) if item.sequence > cursor => {
-                    cursor = item.sequence;
-                    yield Ok(sse_event(item.sequence, &item.event_type, &item.data));
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // The durable replay at the top of the loop closes gaps.
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
+            tokio::select! {
+                item = receiver.recv() => match item {
+                    Ok(item) if item.sequence > cursor => {
+                        cursor = item.sequence;
+                        yield Ok(sse_event(item.sequence, &item.event_type, &item.data));
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // The durable replay at the top of the loop closes gaps.
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = shutdown.changed() => break,
             }
         }
     };

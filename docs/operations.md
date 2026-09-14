@@ -5,8 +5,16 @@ projections, connector records, and stream cursors are implementation overlays.
 
 ## Required controls
 
-- Put authenticated TLS and per-operator authorization in front of the loopback HTTP
-  listener. The current daemon is single-operator, so SSE needs no tenant filtering.
+- Keep the client API and operator UI as separate network planes. The client API is the
+  `PONTMORE_LISTEN` listener; the operator UI is the `PONTMORE_UI_LISTEN` listener. Do
+  not expose the UI as a Pontmore client interface.
+- Keep the operator UI on loopback when using its default passwordless mode. A
+  non-loopback UI bind fails closed unless `PONTMORE_UI_PASSWORD_FILE` and
+  `PONTMORE_UI_SECURE_COOKIES=true` are both configured. Terminate authenticated TLS in
+  front of that listener, restrict ingress to operators, and store the password in a
+  regular owner-only file (mode `0600` on Unix). The current UI is single-operator.
+- Put authenticated transport and authorization in front of the client API before a
+  non-loopback deployment. The UI's login is not client API authentication.
 - Configure multiple independently operated relays where practical. Readiness remains
   false until every configured relay completes its initial backfill.
 - Set `PONTMORE_REQUIRE_CONNECTOR_SANDBOX=true` for value-bearing deployments. Each
@@ -41,5 +49,29 @@ first upgraded start records an execution activation boundary so historical back
 reconstructs state without dispatching old effects. Events received after activation
 remain eligible across restarts.
 
-SIGINT or SIGTERM stops HTTP acceptance, signals relay/worker/retention/health tasks,
-waits for bounded operations, asks connectors to shut down, and exits.
+SIGINT or SIGTERM stops both HTTP listeners, signals relay/worker/retention/health
+tasks, waits for bounded operations, asks connectors to shut down, and exits. Operator
+sessions are intentionally invalidated on every restart because the in-memory signing
+key is not persisted.
+
+## Operator UI security
+
+The UI queries and changes implementation state through the daemon's existing storage,
+coordinator, and connector abstractions; it does not treat database projections as
+canonical protocol state. Operator actions can submit an already-signed event, pause or
+resume new economic execution, queue projection rebuilds, retry failed work or
+publications, probe connector health, and request graceful shutdown. Every modifying
+form requires the authenticated session's CSRF token. Browser responses set a
+restrictive content-security policy, deny framing and content sniffing, and reject
+cross-origin form submissions.
+
+The economic execution switch is durable and shared by daemons using the same database.
+Pausing does not cancel a connector exchange already in flight. Resuming requeues every
+stored coordination; durable operation and connector idempotency remain responsible for
+preventing repeated value movement. Startup-managed configuration is deliberately not
+rewritten from the browser.
+
+The embedded UI has no CDN or runtime package dependency. Its authenticated
+`GET /ui/stream` connection refreshes on daemon events and periodically polls the
+storage view for operational changes. Do not route `/ui/stream` to Pontmore clients;
+their stable stream remains `GET /v1/stream` on the client listener.

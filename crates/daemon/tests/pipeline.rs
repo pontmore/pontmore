@@ -28,6 +28,7 @@ async fn signed_history_rebuilds_and_executes_redacted_idempotent_effects() {
         .activate_execution()
         .await
         .expect("activate execution boundary");
+    assert_execution_switch_is_persistent(&store).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect cleanup pool");
@@ -117,6 +118,19 @@ async fn signed_history_rebuilds_and_executes_redacted_idempotent_effects() {
     assert_expired_lease_is_reclaimed(&store, &pool).await;
     assert_terminal_outcomes_are_mutually_exclusive(&pool).await;
     connectors.shutdown().await;
+}
+
+async fn assert_execution_switch_is_persistent(store: &Store) {
+    store
+        .set_execution_enabled(false)
+        .await
+        .expect("pause execution");
+    assert!(!store.execution_enabled().await.expect("read paused state"));
+    store
+        .set_execution_enabled(true)
+        .await
+        .expect("resume execution");
+    assert!(store.execution_enabled().await.expect("read enabled state"));
 }
 
 async fn assert_expired_lease_is_reclaimed(store: &Store, pool: &PgPool) {

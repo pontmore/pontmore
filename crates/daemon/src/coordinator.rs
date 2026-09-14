@@ -517,6 +517,10 @@ impl Coordinator {
         actions: &[Event],
         applied: &[String],
     ) -> Result<(), CoordinatorError> {
+        if !self.store.execution_enabled().await? {
+            tracing::warn!(coordination_id = %root.id, "economic execution is paused by the operator");
+            return Ok(());
+        }
         let routing: RootRouting = serde_json::from_str(root.content.as_str())?;
         let amount = routing.terms.bitcoin.amount.parse::<u64>().map_err(|_| {
             protocol_failure(

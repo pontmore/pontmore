@@ -16,6 +16,31 @@ pub struct Config {
     #[arg(long, env = "PONTMORE_LISTEN", default_value = "127.0.0.1:7300")]
     pub listen: SocketAddr,
 
+    /// Operator UI listener address.
+    #[arg(long, env = "PONTMORE_UI_LISTEN", default_value = "127.0.0.1:7301")]
+    pub ui_listen: SocketAddr,
+
+    /// Enable the built-in operator UI.
+    #[arg(
+        long,
+        env = "PONTMORE_UI_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub ui_enabled: bool,
+
+    /// Owner-restricted file containing the operator UI password.
+    #[arg(long, env = "PONTMORE_UI_PASSWORD_FILE")]
+    pub ui_password_file: Option<PathBuf>,
+
+    /// Lifetime of an authenticated operator UI session.
+    #[arg(long, env = "PONTMORE_UI_SESSION_TTL_SECS", default_value_t = 28_800)]
+    pub ui_session_ttl_secs: u64,
+
+    /// Mark the operator session cookie Secure when TLS terminates upstream.
+    #[arg(long, env = "PONTMORE_UI_SECURE_COOKIES", default_value_t = false)]
+    pub ui_secure_cookies: bool,
+
     /// JSON file containing the static economic-connector configuration.
     #[arg(long, env = "PONTMORE_CONNECTOR_CONFIG")]
     pub connector_config: Option<PathBuf>,

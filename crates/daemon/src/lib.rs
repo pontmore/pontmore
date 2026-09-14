@@ -1,4 +1,5 @@
-//! Pontmore node, durable event store, SSE API, and economic-connector manager.
+//! Pontmore node, durable event store, client SSE API, operator UI, and
+//! economic-connector manager.
 
 pub mod api;
 pub mod config;
@@ -7,6 +8,7 @@ pub mod coordinator;
 pub mod relay;
 pub mod schema;
 pub mod store;
+pub mod ui;
 pub mod work;
 
 pub use api::{AppState, router};
