@@ -36,3 +36,4 @@ jobs:
           cache: npm
       - run: npm ci
       - run: just check
+      - run: just restart-smoke "$PONTMORE_TEST_DATABASE_URL"

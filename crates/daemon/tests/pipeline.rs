@@ -7,6 +7,7 @@ use pontmored::{
 use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn signed_history_rebuilds_and_executes_redacted_idempotent_effects() {
@@ -23,11 +24,16 @@ async fn signed_history_rebuilds_and_executes_redacted_idempotent_effects() {
         .await
         .expect("connect test store");
     store.migrate().await.expect("apply migrations");
+    store
+        .activate_execution()
+        .await
+        .expect("activate execution boundary");
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect cleanup pool");
     sqlx::query(
-        "TRUNCATE stream_events, connector_operations, coordination_event_links, \
+        "TRUNCATE connector_health, publication_outbox, schema_artifacts, descriptor_revisions, \
+         relay_checkpoints, work_queue, stream_events, connector_operations, coordination_event_links, \
          coordination_projections, raw_events RESTART IDENTITY CASCADE",
     )
     .execute(&pool)
@@ -108,5 +114,46 @@ async fn signed_history_rebuilds_and_executes_redacted_idempotent_effects() {
     assert_eq!(after_duplicate.cursor, cursor);
     assert_eq!(after_duplicate.connector_operations.len(), 2);
 
+    assert_expired_lease_is_reclaimed(&store, &pool).await;
+    assert_terminal_outcomes_are_mutually_exclusive(&pool).await;
     connectors.shutdown().await;
+}
+
+async fn assert_expired_lease_is_reclaimed(store: &Store, pool: &PgPool) {
+    sqlx::query("TRUNCATE work_queue")
+        .execute(pool)
+        .await
+        .expect("truncate work");
+    store
+        .enqueue_work(
+            "rebuild",
+            "crash-recovery",
+            &serde_json::json!({"coordination_id":"missing"}),
+        )
+        .await
+        .expect("enqueue");
+    let first = store
+        .claim_work(Uuid::new_v4(), Duration::from_millis(10))
+        .await
+        .expect("claim")
+        .expect("work");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let second = store
+        .claim_work(Uuid::new_v4(), Duration::from_secs(1))
+        .await
+        .expect("reclaim")
+        .expect("work");
+    assert_eq!(first.work_id, second.work_id);
+    assert_eq!(second.attempts, first.attempts + 1);
+}
+
+async fn assert_terminal_outcomes_are_mutually_exclusive(pool: &PgPool) {
+    sqlx::query("INSERT INTO publication_outbox (event_id, coordination_id, outcome, document) VALUES ('settle-event','terminal-test','settle','{}'::jsonb)")
+        .execute(pool).await.expect("first terminal outcome");
+    let conflicting = sqlx::query("INSERT INTO publication_outbox (event_id, coordination_id, outcome, document) VALUES ('refund-event','terminal-test','refund','{}'::jsonb)")
+        .execute(pool).await;
+    assert!(
+        conflicting.is_err(),
+        "refund must conflict with pending settlement"
+    );
 }

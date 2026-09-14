@@ -31,5 +31,10 @@ tck:
 daemon *args:
     cargo run --locked -p pontmored -- {{ args }}
 
+# Verify graceful whole-daemon restart and SSE snapshot recovery.
+restart-smoke database_url:
+    cargo build --locked -p pontmored
+    bash scripts/restart-smoke.sh {{ quote(database_url) }}
+
 # Run every non-mutating repository check.
 check: format-check lint test tck
