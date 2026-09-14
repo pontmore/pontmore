@@ -71,6 +71,10 @@ pub struct ConnectorManifest {
     pub entrypoint: PathBuf,
     pub entrypoint_sha256: String,
     pub source: String,
+    #[serde(default)]
+    pub operation_secrets: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub signs_outcomes: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +92,7 @@ enum ConnectorCommand {
         network: String,
         operation: EconomicOperation,
         payload: Value,
+        secrets: BTreeMap<String, String>,
     },
     Inspect {
         operation_id: Uuid,
@@ -123,6 +128,17 @@ pub struct ConnectorResult {
     pub result: Value,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectorHealth {
+    pub connector_id: String,
+    pub package_version: String,
+    pub entrypoint_sha256: String,
+    pub healthy: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -157,9 +173,17 @@ impl ConnectorProcess {
         entrypoint: PathBuf,
         expected_digest: String,
         exchange_timeout: Duration,
+        sandbox: Option<&crate::config::SandboxConfig>,
     ) -> Result<Self, ConnectorError> {
         verify_digest(&entrypoint, &expected_digest).await?;
-        let mut child = Command::new(&entrypoint)
+        let mut command = if let Some(sandbox) = sandbox {
+            let mut command = Command::new(&sandbox.launcher);
+            command.args(&sandbox.args).arg("--").arg(&entrypoint);
+            command
+        } else {
+            Command::new(&entrypoint)
+        };
+        let mut child = command
             .env_clear()
             .env(
                 "PONTMORE_CONNECTOR_API_VERSION",
@@ -167,7 +191,7 @@ impl ConnectorProcess {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
@@ -176,6 +200,16 @@ impl ConnectorProcess {
         let stdout = child.stdout.take().ok_or_else(|| {
             ConnectorError::InvalidResponse("connector stdout was unavailable".to_owned())
         })?;
+        if let Some(stderr) = child.stderr.take() {
+            let label = entrypoint.display().to_string();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let bounded = line.get(..4_096).unwrap_or(&line);
+                    tracing::warn!(connector = %label, stderr = %bounded, "connector diagnostic");
+                }
+            });
+        }
         let mut process = Self {
             entrypoint,
             expected_digest,
@@ -256,10 +290,35 @@ struct InstalledConnector {
     expected_digest: String,
     exchange_timeout: Duration,
     process: Mutex<Option<ConnectorProcess>>,
+    sandbox: Option<crate::config::SandboxConfig>,
+    secrets: BTreeMap<String, PathBuf>,
+    failures: Mutex<FailureState>,
+}
+
+#[derive(Default)]
+struct FailureState {
+    consecutive: u32,
+    retry_after: Option<tokio::time::Instant>,
 }
 
 impl InstalledConnector {
     async fn exchange(&self, command: ConnectorCommand) -> Result<ConnectorResult, ConnectorError> {
+        {
+            let failures = self.failures.lock().await;
+            if failures.consecutive >= 8 {
+                return Err(ConnectorError::Exited(
+                    "restart budget exhausted".to_owned(),
+                ));
+            }
+            if failures
+                .retry_after
+                .is_some_and(|deadline| deadline > tokio::time::Instant::now())
+            {
+                return Err(ConnectorError::Exited(
+                    "restart backoff is active".to_owned(),
+                ));
+            }
+        }
         let mut process = self.process.lock().await;
         if process.is_none() {
             *process = Some(
@@ -267,6 +326,7 @@ impl InstalledConnector {
                     self.entrypoint.clone(),
                     self.expected_digest.clone(),
                     self.exchange_timeout,
+                    self.sandbox.as_ref(),
                 )
                 .await?,
             );
@@ -280,6 +340,15 @@ impl InstalledConnector {
             && let Some(mut failed) = process.take()
         {
             let _ = failed.child.kill().await;
+        }
+        let mut failures = self.failures.lock().await;
+        if result.is_ok() {
+            failures.consecutive = 0;
+            failures.retry_after = None;
+        } else {
+            failures.consecutive = failures.consecutive.saturating_add(1);
+            let delay = 2_u64.pow(failures.consecutive.min(8)).min(300);
+            failures.retry_after = Some(tokio::time::Instant::now() + Duration::from_secs(delay));
         }
         result
     }
@@ -301,6 +370,18 @@ impl ConnectorManager {
         path: Option<&Path>,
         exchange_timeout: Duration,
     ) -> Result<Self, ConnectorError> {
+        Self::load_with_policy(path, exchange_timeout, false).await
+    }
+
+    /// Load connectors and optionally require an OS sandbox.
+    ///
+    /// # Errors
+    /// Returns configuration, digest, spawn, or handshake errors.
+    pub async fn load_with_policy(
+        path: Option<&Path>,
+        exchange_timeout: Duration,
+        require_sandbox: bool,
+    ) -> Result<Self, ConnectorError> {
         let Some(path) = path else {
             return Ok(Self::default());
         };
@@ -311,6 +392,11 @@ impl ConnectorManager {
         for (expected_id, registration) in config.connectors {
             if !registration.enabled {
                 continue;
+            }
+            if require_sandbox && registration.sandbox.is_none() {
+                return Err(ConnectorError::Configuration(format!(
+                    "connector `{expected_id}` has no required sandbox launcher"
+                )));
             }
             let manifest_path = if registration.manifest.is_absolute() {
                 registration.manifest
@@ -327,8 +413,21 @@ impl ConnectorManager {
                 entrypoint.clone(),
                 manifest.entrypoint_sha256.clone(),
                 exchange_timeout,
+                registration.sandbox.as_ref(),
             )
             .await?;
+            let secrets = registration
+                .secrets
+                .into_iter()
+                .map(|(name, path)| {
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        config_base.join(path)
+                    };
+                    (name, path)
+                })
+                .collect();
             connectors.insert(
                 expected_id,
                 Arc::new(InstalledConnector {
@@ -337,6 +436,9 @@ impl ConnectorManager {
                     expected_digest: process.expected_digest.clone(),
                     exchange_timeout,
                     process: Mutex::new(Some(process)),
+                    sandbox: registration.sandbox,
+                    secrets,
+                    failures: Mutex::new(FailureState::default()),
                 }),
             );
         }
@@ -351,6 +453,32 @@ impl ConnectorManager {
             .values()
             .map(|connector| connector.manifest.clone())
             .collect()
+    }
+
+    /// Return the pinned package version and executable digest.
+    ///
+    /// # Errors
+    /// Returns an error when the connector is not configured.
+    pub fn audit_identity(&self, connector_id: &str) -> Result<(String, String), ConnectorError> {
+        let connector = self
+            .connectors
+            .get(connector_id)
+            .ok_or_else(|| ConnectorError::NotConfigured(connector_id.to_owned()))?;
+        Ok((
+            connector.manifest.package_version.clone(),
+            connector.manifest.entrypoint_sha256.clone(),
+        ))
+    }
+
+    /// Whether the connector contract requires every successful effect to carry a signed outcome.
+    ///
+    /// # Errors
+    /// Returns an error when the connector is not configured.
+    pub fn signs_outcomes(&self, connector_id: &str) -> Result<bool, ConnectorError> {
+        self.connectors
+            .get(connector_id)
+            .map(|connector| connector.manifest.signs_outcomes)
+            .ok_or_else(|| ConnectorError::NotConfigured(connector_id.to_owned()))
     }
 
     /// Select the only connector authorized for an exact profile, network, and
@@ -405,6 +533,23 @@ impl ConnectorManager {
     /// Returns an error when the connector is absent, unhealthy, or returns invalid data.
     pub async fn health(&self, connector_id: &str) -> Result<ConnectorResult, ConnectorError> {
         self.exchange(connector_id, ConnectorCommand::Health).await
+    }
+
+    pub async fn health_all(&self) -> Vec<ConnectorHealth> {
+        let mut health = Vec::with_capacity(self.connectors.len());
+        for connector in self.connectors.values() {
+            let outcome = connector.exchange(ConnectorCommand::Health).await;
+            health.push(ConnectorHealth {
+                connector_id: connector.manifest.id.clone(),
+                package_version: connector.manifest.package_version.clone(),
+                entrypoint_sha256: connector.manifest.entrypoint_sha256.clone(),
+                healthy: outcome
+                    .as_ref()
+                    .is_ok_and(|result| result.status == ConnectorStatus::Succeeded),
+                error: outcome.err().map(|error| error.to_string()),
+            });
+        }
+        health
     }
 
     /// Execute one daemon-authorized economic operation.
@@ -465,6 +610,7 @@ impl ConnectorManager {
                 network: execution.network,
                 operation: execution.operation,
                 payload: execution.payload,
+                secrets: connector.load_secrets(execution.operation).await?,
             },
         )
         .await
@@ -505,6 +651,50 @@ impl ConnectorManager {
                 let _ = running.child.wait().await;
             }
         }
+    }
+}
+
+impl InstalledConnector {
+    async fn load_secrets(
+        &self,
+        operation: EconomicOperation,
+    ) -> Result<BTreeMap<String, String>, ConnectorError> {
+        let operation = economic_operation_name(operation);
+        let required = self
+            .manifest
+            .operation_secrets
+            .get(operation)
+            .cloned()
+            .unwrap_or_default();
+        let mut values = BTreeMap::new();
+        for name in required {
+            let path = self.secrets.get(&name).ok_or_else(|| {
+                ConnectorError::Configuration(format!("secret `{name}` is not configured"))
+            })?;
+            let metadata = fs::metadata(path).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(ConnectorError::Configuration(format!(
+                        "secret file {} must not be group/world accessible",
+                        path.display()
+                    )));
+                }
+            }
+            let value = fs::read_to_string(path).await?;
+            values.insert(name, value.trim_end().to_owned());
+        }
+        Ok(values)
+    }
+}
+
+const fn economic_operation_name(operation: EconomicOperation) -> &'static str {
+    match operation {
+        EconomicOperation::EscrowSecure => "escrow_secure",
+        EconomicOperation::EscrowSettle => "escrow_settle",
+        EconomicOperation::EscrowRefund => "escrow_refund",
+        EconomicOperation::ResolveDispute => "resolve_dispute",
     }
 }
 
@@ -596,6 +786,8 @@ mod tests {
             entrypoint: PathBuf::from("../escape"),
             entrypoint_sha256: "0".repeat(64),
             source: "https://example.test/source".to_owned(),
+            operation_secrets: BTreeMap::new(),
+            signs_outcomes: false,
         };
         assert!(validate_manifest("example/escrow", &manifest).is_err());
     }
@@ -659,11 +851,43 @@ mod tests {
             )
             .await;
         assert!(failed.is_err());
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
         let health = manager
             .health("pontmore/simulated-escrow")
             .await
             .expect("next exchange should start and handshake with a replacement process");
         assert_eq!(health.status, ConnectorStatus::Succeeded);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_and_timed_out_connectors_are_contained() {
+        let config =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors.example.json");
+        for (failure, expected) in [
+            ("malformed", "invalid connector response"),
+            ("timeout", "timed out"),
+        ] {
+            let manager = ConnectorManager::load(Some(&config), Duration::from_millis(100))
+                .await
+                .expect("load connector");
+            let error = manager
+                .execute(
+                    "pontmore/simulated-escrow",
+                    ConnectorExecution {
+                        operation_id: Uuid::new_v4(),
+                        idempotency_key: format!("test:{failure}"),
+                        coordination_id: "coordination".to_owned(),
+                        profile: "pontmore/swap@1".to_owned(),
+                        network: "regtest".to_owned(),
+                        operation: EconomicOperation::EscrowSecure,
+                        payload: json!({"inject_failure": failure}),
+                    },
+                )
+                .await
+                .expect_err("fault must be contained");
+            assert!(error.to_string().contains(expected), "{error}");
+            manager.shutdown().await;
+        }
     }
 }

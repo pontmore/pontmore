@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use nostr::event::Event;
 use pontmore::Reconstruction;
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,8 @@ pub enum StoreError {
     EventCollision,
     #[error("operation idempotency key already names different input")]
     IdempotencyConflict,
+    #[error("settlement and refund publication are mutually exclusive")]
+    TerminalOutcomeConflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,6 +52,7 @@ pub struct ConnectorOperation {
     pub request: Value,
     pub response: Option<Value>,
     pub error: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 /// Redacted connector progress safe for the client SSE stream.
@@ -70,6 +75,7 @@ pub struct StreamEvent {
 /// Initial client view emitted when an SSE cursor is not supplied.
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamSnapshot {
+    pub schema_version: u64,
     pub cursor: i64,
     pub coordinations: Vec<Value>,
     pub connector_operations: Vec<PublicConnectorOperation>,
@@ -83,6 +89,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) const fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Connect to the durable database.
     ///
     /// # Errors
@@ -114,6 +124,26 @@ impl Store {
     pub async fn ready(&self) -> Result<(), StoreError> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// Establish the one-time economic execution boundary. Historical events imported
+    /// before this daemon version reconstruct state but cannot trigger new value movement.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn activate_execution(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE daemon_state SET value = to_jsonb(now()), updated_at = now() WHERE key = 'execution_activation_cursor' AND value = 'null'::jsonb")
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Check whether an event arrived after the activation boundary.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn execution_eligible(&self, event_id: &str) -> Result<bool, StoreError> {
+        Ok(sqlx::query_scalar("SELECT raw_events.received_at >= (SELECT (value #>> '{}')::timestamptz FROM daemon_state WHERE key = 'execution_activation_cursor') FROM raw_events WHERE event_id = $1")
+            .bind(event_id).fetch_optional(&self.pool).await?.unwrap_or(false))
     }
 
     /// Mark connector operations interrupted by a prior daemon exit as ambiguous.
@@ -166,6 +196,13 @@ impl Store {
                 .bind(predecessor_event_id)
                 .execute(&mut *transaction)
                 .await?;
+            }
+            if let Some(coordination_id) = coordination_id_for(event) {
+                sqlx::query("INSERT INTO work_queue (work_id, work_type, idempotency_key, payload) VALUES ($1, 'rebuild', $2, $3) ON CONFLICT (idempotency_key) DO UPDATE SET status = CASE WHEN work_queue.status = 'completed' THEN 'pending' ELSE work_queue.status END, available_at = now(), updated_at = now()")
+                    .bind(Uuid::new_v4())
+                    .bind(format!("rebuild:{coordination_id}"))
+                    .bind(json!({"coordination_id": coordination_id}))
+                    .execute(&mut *transaction).await?;
             }
             let stream_event = append_stream_event(
                 &mut transaction,
@@ -285,6 +322,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns a storage error or an idempotency conflict.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_operation(
         &self,
         connector_id: &str,
@@ -293,14 +331,16 @@ impl Store {
         operation: &str,
         trigger_event_id: &str,
         request: &Value,
+        connector_version: &str,
+        connector_digest: &str,
     ) -> Result<(ConnectorOperation, bool, Option<StreamEvent>), StoreError> {
         let operation_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await?;
         let inserted = sqlx::query(
             "INSERT INTO connector_operations \
              (operation_id, connector_id, idempotency_key, coordination_id, operation_type, \
-              trigger_event_id, status, request) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'running', $7) \
+             trigger_event_id, status, request, connector_version, connector_digest) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'running', $7, $8, $9) \
              ON CONFLICT (idempotency_key) DO NOTHING",
         )
         .bind(operation_id)
@@ -310,20 +350,34 @@ impl Store {
         .bind(operation)
         .bind(trigger_event_id)
         .bind(request)
+        .bind(connector_version)
+        .bind(connector_digest)
         .execute(&mut *transaction)
         .await?;
-        let created = inserted.rows_affected() == 1;
+        let mut created = inserted.rows_affected() == 1;
         let row = sqlx::query(
             "SELECT operation_id, connector_id, idempotency_key, coordination_id, operation_type, \
-             trigger_event_id, status, request, response, error \
+             trigger_event_id, status, request, response, error, failure_class \
              FROM connector_operations WHERE idempotency_key = $1",
         )
         .bind(idempotency_key)
         .fetch_one(&mut *transaction)
         .await?;
-        let operation = operation_from_row(&row)?;
+        let mut operation = operation_from_row(&row)?;
         if operation.connector_id != connector_id || operation.request != *request {
             return Err(StoreError::IdempotencyConflict);
+        }
+        if !created
+            && operation.status == OperationStatus::Failed
+            && operation.failure_class.as_deref() == Some("retryable")
+        {
+            sqlx::query("UPDATE connector_operations SET status = 'running', response = NULL, error = NULL, failure_class = NULL, updated_at = now() WHERE operation_id = $1")
+                .bind(operation.operation_id).execute(&mut *transaction).await?;
+            operation.status = OperationStatus::Running;
+            operation.response = None;
+            operation.error = None;
+            operation.failure_class = None;
+            created = true;
         }
         let stream_event = if created {
             Some(
@@ -352,18 +406,20 @@ impl Store {
         status: OperationStatus,
         response: Option<&Value>,
         error: Option<&str>,
+        failure_class: Option<&str>,
     ) -> Result<StreamEvent, StoreError> {
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
-            "UPDATE connector_operations SET status = $2, response = $3, error = $4, \
+            "UPDATE connector_operations SET status = $2, response = $3, error = $4, failure_class = $5, \
              updated_at = now() WHERE operation_id = $1 \
              RETURNING operation_id, connector_id, idempotency_key, coordination_id, \
-             operation_type, trigger_event_id, status, request, response, error",
+             operation_type, trigger_event_id, status, request, response, error, failure_class",
         )
         .bind(operation_id)
         .bind(status_name(status))
         .bind(response)
         .bind(error)
+        .bind(failure_class)
         .fetch_one(&mut *transaction)
         .await?;
         let operation = operation_from_row(&row)?;
@@ -408,6 +464,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         transaction.commit().await?;
         Ok(StreamSnapshot {
+            schema_version: 1,
             cursor,
             coordinations,
             connector_operations,
@@ -422,7 +479,7 @@ impl Store {
     pub async fn ambiguous_operations(&self) -> Result<Vec<ConnectorOperation>, StoreError> {
         let rows = sqlx::query(
             "SELECT operation_id, connector_id, idempotency_key, coordination_id, operation_type, \
-             trigger_event_id, status, request, response, error FROM connector_operations \
+             trigger_event_id, status, request, response, error, failure_class FROM connector_operations \
              WHERE status = 'ambiguous' ORDER BY created_at, operation_id",
         )
         .fetch_all(&self.pool)
@@ -460,6 +517,41 @@ impl Store {
             })
             .collect()
     }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn stream_bounds(&self) -> Result<Option<(i64, i64)>, StoreError> {
+        let row =
+            sqlx::query("SELECT MIN(sequence) AS first, MAX(sequence) AS last FROM stream_events")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(match (row.try_get("first")?, row.try_get("last")?) {
+            (Some(first), Some(last)) => Some((first, last)),
+            _ => None,
+        })
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn prune_stream(&self, retention: Duration) -> Result<u64, StoreError> {
+        let seconds = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
+        let result = sqlx::query("DELETE FROM stream_events WHERE created_at < now() - make_interval(secs => $1::double precision)")
+            .bind(seconds).execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn record_connector_health(
+        &self,
+        health: &crate::connector::ConnectorHealth,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO connector_health (connector_id, package_version, entrypoint_sha256, status, consecutive_failures, last_ok_at, last_error) VALUES ($1,$2,$3,$4,$5,CASE WHEN $6 THEN now() ELSE NULL END,$7) ON CONFLICT (connector_id) DO UPDATE SET package_version = EXCLUDED.package_version, entrypoint_sha256 = EXCLUDED.entrypoint_sha256, status = EXCLUDED.status, consecutive_failures = CASE WHEN $6 THEN 0 ELSE connector_health.consecutive_failures + 1 END, last_ok_at = CASE WHEN $6 THEN now() ELSE connector_health.last_ok_at END, last_error = EXCLUDED.last_error, updated_at = now()")
+            .bind(&health.connector_id).bind(&health.package_version).bind(&health.entrypoint_sha256)
+            .bind(if health.healthy { "healthy" } else { "degraded" }).bind(i32::from(!health.healthy))
+            .bind(health.healthy).bind(&health.error).execute(&self.pool).await?;
+        Ok(())
+    }
 }
 
 async fn append_stream_event(
@@ -494,6 +586,7 @@ fn operation_from_row(row: &sqlx::postgres::PgRow) -> Result<ConnectorOperation,
         request: row.try_get("request")?,
         response: row.try_get("response")?,
         error: row.try_get("error")?,
+        failure_class: row.try_get("failure_class")?,
     })
 }
 
@@ -525,6 +618,14 @@ fn action_links(event: &Event) -> Option<(&str, &str)> {
         single_marked_event(event, "root")?,
         single_marked_event(event, "prev")?,
     ))
+}
+
+fn coordination_id_for(event: &Event) -> Option<String> {
+    match event.kind.as_u16() {
+        7300 => Some(event.id.to_hex()),
+        7301 => single_marked_event(event, "root").map(str::to_owned),
+        _ => None,
+    }
 }
 
 fn single_marked_event<'a>(event: &'a Event, marker: &str) -> Option<&'a str> {

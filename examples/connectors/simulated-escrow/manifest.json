@@ -9,6 +9,6 @@
     "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
   ],
   "entrypoint": "simulated-escrow.py",
-  "entrypoint_sha256": "b1ac611f0d2853a84f709a4ffb03844f465d760eb2dc9e337ae227f4f0c878b6",
+  "entrypoint_sha256": "4386b2ebc3382c68655df90d2eec55aa6550ee993c46daf6a40af7d66c59f526",
   "source": "https://github.com/pontmore/pontmore/tree/main/examples/connectors/simulated-escrow"
 }

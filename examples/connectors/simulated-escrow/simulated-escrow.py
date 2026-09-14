@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import time
 
 
 def respond(request: dict, status: str, result: dict, error: str | None = None) -> None:
@@ -15,6 +16,7 @@ def respond(request: dict, status: str, result: dict, error: str | None = None) 
                 "status": status,
                 "result": result,
                 "error": error,
+                "retryable": False,
             },
             separators=(",", ":"),
         ),
@@ -39,9 +41,14 @@ def main() -> None:
             failure = command.get("payload", {}).get("inject_failure")
             if failure == "exit":
                 return
+            elif failure == "malformed":
+                print("{not-json", flush=True)
+            elif failure == "timeout":
+                time.sleep(1)
+                respond(request, "succeeded", {"late": True})
             elif failure == "ambiguous":
                 respond(request, "ambiguous", {}, "simulated outcome is unknown")
-            elif failure == "failed":
+            elif failure in {"failed", "retryable"}:
                 outcomes[operation_id] = "failed"
                 idempotent_outcomes[idempotency_key] = "failed"
                 respond(request, "failed", {}, "simulated operation failed")

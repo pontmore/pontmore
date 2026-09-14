@@ -25,6 +25,8 @@ pub struct AppState {
     pub store: Store,
     pub coordinator: Coordinator,
     pub stream_sender: broadcast::Sender<StreamEvent>,
+    pub max_replay: i64,
+    pub required_relays: usize,
 }
 
 /// Build the deliberately small client API.
@@ -47,6 +49,12 @@ async fn live() -> Json<Value> {
 
 async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     state.store.ready().await?;
+    if !state.store.relay_readiness(state.required_relays).await? {
+        return Err(ApiError::unavailable(
+            "RELAY_NOT_READY",
+            "relay backfill is not complete",
+        ));
+    }
     Ok(Json(json!({"status": "ready"})))
 }
 
@@ -65,7 +73,9 @@ async fn put_event(
     if let Some(stream_event) = stream_event {
         let _ = state.stream_sender.send(stream_event);
     }
-    state.coordinator.process_event(&input.event).await?;
+    if input.event.kind.as_u16() == 30_361 {
+        state.coordinator.process_event(&input.event).await?;
+    }
     let status = if outcome == InsertOutcome::Inserted {
         StatusCode::ACCEPTED
     } else {
@@ -79,6 +89,22 @@ async fn stream(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let supplied_cursor = parse_cursor(&headers)?;
+    if let (Some(cursor), Some((first, last))) =
+        (supplied_cursor, state.store.stream_bounds().await?)
+    {
+        if cursor < first.saturating_sub(1) {
+            return Err(ApiError::gone(
+                "STREAM_CURSOR_EXPIRED",
+                "Last-Event-ID is older than retained history",
+            ));
+        }
+        if last.saturating_sub(cursor) > state.max_replay {
+            return Err(ApiError::conflict(
+                "STREAM_REPLAY_LIMIT",
+                "replay exceeds the configured maximum; reconnect without a cursor for a snapshot",
+            ));
+        }
+    }
     let mut receiver = state.stream_sender.subscribe();
     let initial = if supplied_cursor.is_none() {
         Some(state.store.stream_snapshot().await?)
@@ -88,10 +114,12 @@ async fn stream(
     let mut cursor =
         supplied_cursor.unwrap_or_else(|| initial.as_ref().map_or(0, |snapshot| snapshot.cursor));
     let store = state.store;
+    let max_replay = state.max_replay;
 
     let events = async_stream::stream! {
         if let Some(snapshot) = initial {
             let data = json!({
+                "schema_version": snapshot.schema_version,
                 "coordinations": snapshot.coordinations,
                 "connector_operations": snapshot.connector_operations,
             });
@@ -99,6 +127,17 @@ async fn stream(
         }
 
         loop {
+            match store.stream_bounds().await {
+                Ok(Some((_, last))) if last.saturating_sub(cursor) > max_replay => {
+                    yield Ok(sse_event(cursor, "stream_error", &json!({"code":"STREAM_REPLAY_LIMIT","message":"consumer fell behind retained replay budget"})));
+                    break;
+                }
+                Err(error) => {
+                    yield Ok(sse_event(cursor, "stream_error", &json!({"code":"STORAGE_ERROR","message":error.to_string()})));
+                    break;
+                }
+                _ => {}
+            }
             match store.stream_events_after(cursor, STREAM_PAGE_SIZE).await {
                 Ok(replay) if !replay.is_empty() => {
                     for item in replay {
@@ -190,12 +229,34 @@ impl ApiError {
             },
         }
     }
+
+    fn unavailable(code: &'static str, message: &'static str) -> Self {
+        Self::simple(StatusCode::SERVICE_UNAVAILABLE, code, message)
+    }
+    fn gone(code: &'static str, message: &'static str) -> Self {
+        Self::simple(StatusCode::GONE, code, message)
+    }
+    fn conflict(code: &'static str, message: &'static str) -> Self {
+        Self::simple(StatusCode::CONFLICT, code, message)
+    }
+    fn simple(status: StatusCode, code: &'static str, message: &'static str) -> Self {
+        Self {
+            status,
+            body: ErrorBody {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                details: None,
+            },
+        }
+    }
 }
 
 impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {
-            StoreError::EventCollision | StoreError::IdempotencyConflict => Self {
+            StoreError::EventCollision
+            | StoreError::IdempotencyConflict
+            | StoreError::TerminalOutcomeConflict => Self {
                 status: StatusCode::CONFLICT,
                 body: ErrorBody {
                     code: "CONFLICT".to_owned(),
@@ -229,6 +290,7 @@ impl From<CoordinatorError> for ApiError {
             CoordinatorError::Store(error) => error.into(),
             CoordinatorError::DescriptorConfiguration(_)
             | CoordinatorError::Connector(_)
+            | CoordinatorError::Schema(_)
             | CoordinatorError::Io(_)
             | CoordinatorError::Json(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,

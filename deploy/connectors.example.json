@@ -5,6 +5,10 @@
       "enabled": true
     }
   },
+  "execution_policy": {
+    "max_automatic_sats": 1000000,
+    "approved_coordination_ids": []
+  },
   "descriptor_bindings": {
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
       "event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
