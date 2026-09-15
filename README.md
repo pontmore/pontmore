@@ -63,6 +63,7 @@ tck/vectors/            language-neutral executable cases
 ## Run
 
 ```console
+just setup
 just format
 just check
 
@@ -79,13 +80,31 @@ The client API defaults to `127.0.0.1:7300`. It verifies every signed event befo
 durable storage. Public signed events remain canonical; projections, stream cursors,
 connector operations, and private database records are implementation overlays.
 
-Start a local node with:
+After cloning, run `just setup` to fetch Rust crates with the pinned toolchain and
+install the locked npm formatters. The npm packages are development-only: the daemon and
+embedded UI run without Node.js. For Rust-only work, use `just setup-rust`; run
+`just setup-format` before `just format` or `just check`. Install `just` and `rustup`
+first; the formatting recipe also requires Node.js/npm. The local container recipes
+additionally require Docker with Compose and OpenSSL.
+
+Start or stop a local Docker node with:
 
 ```console
-docker compose up --build
+just docker-up
 curl http://127.0.0.1:7300/health/ready
 curl -N http://127.0.0.1:7300/v1/stream
+just docker-status
+just docker-down
 ```
+
+`just docker-up` copies `.env.example` to the git-ignored `.env` on first use. Edit that
+file to change local ports or other daemon settings. The operator UI defaults to
+`http://localhost:7301`; its generated login password is in the git-ignored, owner-only
+`.pontmore/ui-password` file. Compose mounts that directory read-only and runs this
+local-only daemon container as root so it can read the owner-only file; production
+deployments should use a non-root runtime and managed secrets. `docker-down` preserves
+the PostgreSQL volume, `.env`, and password. Published ports bind only to host loopback.
+Use `just docker-logs` to follow daemon logs.
 
 The deliberately small HTTP surface is:
 
@@ -148,7 +167,9 @@ Daemon configuration uses one environment-variable namespace:
 - `PONTMORE_CONNECTOR_CONFIG` selects the static connector allowlist and descriptor
   registry; and
 - `PONTMORE_CONNECTOR_TIMEOUT_MS` defaults to `30000`;
-- `PONTMORE_RELAYS` is a comma-separated relay allowlist;
+- `PONTMORE_RELAYS` is a comma-separated startup relay allowlist. Operators can also
+  connect `wss://` relays at runtime from the Configuration page; these URLs are stored
+  in PostgreSQL and reconnect after restart without changing the environment;
 - `PONTMORE_RELAY_LOOKBACK_SECS` defaults to seven days;
 - `PONTMORE_SCHEMA_MAX_BYTES` defaults to 2 MiB;
 - `PONTMORE_WORK_LEASE_SECS` defaults to 60 and must exceed connector timeout;

@@ -2,11 +2,11 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: pontmore
-      POSTGRES_USER: pontmore
-      POSTGRES_PASSWORD: pontmore-development-only
+      POSTGRES_DB: ${POSTGRES_DB:-pontmore}
+      POSTGRES_USER: ${POSTGRES_USER:-pontmore}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pontmore-development-only}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pontmore"]
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 2s
       timeout: 2s
       retries: 20
@@ -15,15 +15,17 @@ services:
 
   pontmored:
     build: .
+    # Local-only override: reads the owner-only bind-mounted operator password.
+    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      PONTMORE_DATABASE_URL: postgres://pontmore:pontmore-development-only@postgres/pontmore
-      PONTMORE_LISTEN: 0.0.0.0:7300
-      RUST_LOG: pontmored=info,tower_http=info
+    env_file: .env
     ports:
-      - "127.0.0.1:7300:7300"
+      - "127.0.0.1:${PONTMORE_CLIENT_PORT:-7300}:7300"
+      - "127.0.0.1:${PONTMORE_UI_PORT:-7301}:7301"
+    volumes:
+      - ./.pontmore:/run/pontmore:ro
 
 volumes:
   pontmore-postgres:

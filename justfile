@@ -1,7 +1,34 @@
 set shell := ["bash", "-euc"]
-set unstable
+set unstable := true
 
 default: check
+
+# Install all contributor dependencies after cloning.
+setup: setup-rust setup-format
+
+# Fetch the locked Rust crates (the pinned toolchain is selected by rustup).
+setup-rust:
+    cargo fetch --locked
+
+# Install the locked, development-only JavaScript formatters.
+setup-format:
+    npm ci
+
+# Start the local Docker stack and keep its PostgreSQL data between runs.
+docker-up:
+    bash scripts/docker-up.sh
+
+# Stop only the local Docker stack; the PostgreSQL volume is preserved.
+docker-down:
+    docker compose -p pontmore-local down
+
+# Show the local Docker services and their health.
+docker-status:
+    docker compose -p pontmore-local ps
+
+# Follow logs from the local Docker daemon.
+docker-logs:
+    docker compose -p pontmore-local logs -f pontmored
 
 # Format the justfile, Rust workspace, documentation, fixtures, workflows, and manifests.
 format:

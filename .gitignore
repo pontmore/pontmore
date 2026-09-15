@@ -1,4 +1,6 @@
 /target/
 /node_modules/
+/.pontmore/
+/.env
 *.swp
 .DS_Store
