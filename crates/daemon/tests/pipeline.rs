@@ -34,12 +34,14 @@ async fn signed_history_rebuilds_and_executes_redacted_idempotent_effects() {
         .expect("connect cleanup pool");
     sqlx::query(
         "TRUNCATE connector_health, publication_outbox, schema_artifacts, descriptor_revisions, \
-         relay_checkpoints, work_queue, stream_events, connector_operations, coordination_event_links, \
+         operator_relays, relay_checkpoints, work_queue, stream_events, connector_operations, coordination_event_links, \
          coordination_projections, raw_events RESTART IDENTITY CASCADE",
     )
     .execute(&pool)
     .await
     .expect("reset dedicated test database");
+
+    assert_operator_relays_are_persistent(&store, &database_url).await;
 
     let manifest_config =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors.example.json");
@@ -131,6 +133,44 @@ async fn assert_execution_switch_is_persistent(store: &Store) {
         .await
         .expect("resume execution");
     assert!(store.execution_enabled().await.expect("read enabled state"));
+}
+
+async fn assert_operator_relays_are_persistent(store: &Store, database_url: &str) {
+    let relay = "wss://relay.example.com/";
+    assert!(store.add_operator_relay(relay).await.expect("save relay"));
+    assert!(
+        !store
+            .add_operator_relay(relay)
+            .await
+            .expect("deduplicate relay")
+    );
+    assert_eq!(
+        store
+            .effective_relay_urls(&[relay.to_owned()])
+            .await
+            .expect("merge startup and operator relays"),
+        vec![relay],
+    );
+    assert!(
+        !store
+            .relay_readiness(&[])
+            .await
+            .expect("pending relay readiness")
+    );
+    let reopened = Store::connect(database_url).await.expect("reopen store");
+    assert_eq!(
+        reopened
+            .operator_relay_urls()
+            .await
+            .expect("load saved relays"),
+        vec![relay],
+    );
+    let dashboard = reopened
+        .operator_dashboard()
+        .await
+        .expect("operator dashboard");
+    assert_eq!(dashboard.operator_relay_urls, vec![relay]);
+    assert!(dashboard.relays.iter().any(|row| row.relay_url == relay));
 }
 
 async fn assert_expired_lease_is_reclaimed(store: &Store, pool: &PgPool) {

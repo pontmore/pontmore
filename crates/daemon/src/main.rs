@@ -110,7 +110,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             stream_sender,
             shutdown: shutdown_sender.subscribe(),
             max_replay: config.stream_max_replay,
-            required_relays: config.relays.len(),
+            startup_relays: config.relays.clone(),
         },
         shutdown_sender.subscribe(),
         connectors.manifests().len(),

@@ -106,6 +106,7 @@ pub struct OperatorDashboard {
     pub operations: BTreeMap<String, i64>,
     pub publications: BTreeMap<String, i64>,
     pub relays: Vec<OperatorRelay>,
+    pub operator_relay_urls: Vec<String>,
     pub connectors: Vec<OperatorConnector>,
     pub recent_events: Vec<OperatorEvent>,
     pub recent_work: Vec<OperatorWork>,
@@ -811,6 +812,22 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) async fn mark_relay_connected(&self, url: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE relay_checkpoints SET last_connected_at = now(), last_error = NULL, updated_at = now() WHERE relay_url = $1")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn mark_relay_disconnected(&self, url: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE relay_checkpoints SET last_connected_at = NULL, last_error = 'disconnected', updated_at = now() WHERE relay_url = $1")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn mark_relay_error(&self, url: &str, error: &str) -> Result<(), StoreError> {
         sqlx::query("INSERT INTO relay_checkpoints (relay_url, last_error) VALUES ($1, $2) ON CONFLICT (relay_url) DO UPDATE SET last_error = EXCLUDED.last_error, updated_at = now()")
             .bind(url)
@@ -830,6 +847,60 @@ impl Store {
         Ok(())
     }
 
+    /// Persist an operator-selected relay and make its pending state visible immediately.
+    /// Returns false when the URL was already selected.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn add_operator_relay(&self, url: &str) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO operator_relays (relay_url) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(url)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted {
+            sqlx::query(
+                "INSERT INTO relay_checkpoints (relay_url) VALUES ($1) ON CONFLICT DO NOTHING",
+            )
+            .bind(url)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Load durable relays selected through the operator UI.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn operator_relay_urls(&self) -> Result<Vec<String>, StoreError> {
+        Ok(
+            sqlx::query_scalar("SELECT relay_url FROM operator_relays ORDER BY relay_url")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Merge restart-managed URLs with durable operator URLs, without duplicates.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub async fn effective_relay_urls(
+        &self,
+        startup: &[String],
+    ) -> Result<Vec<String>, StoreError> {
+        let mut urls = startup.to_vec();
+        urls.extend(self.operator_relay_urls().await?);
+        urls.sort();
+        urls.dedup();
+        Ok(urls)
+    }
+
     /// Mark an outbox event observed through relay ingestion.
     ///
     /// # Errors
@@ -846,14 +917,16 @@ impl Store {
     ///
     /// # Errors
     /// Returns a storage error.
-    pub async fn relay_readiness(&self, required: usize) -> Result<bool, StoreError> {
-        if required == 0 {
+    pub async fn relay_readiness(&self, startup: &[String]) -> Result<bool, StoreError> {
+        let urls = self.effective_relay_urls(startup).await?;
+        if urls.is_empty() {
             return Ok(true);
         }
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_checkpoints WHERE backfill_complete AND last_connected_at > now() - interval '5 minutes'")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_checkpoints WHERE relay_url = ANY($1) AND backfill_complete AND last_connected_at > now() - interval '5 minutes'")
+            .bind(&urls)
             .fetch_one(&self.pool)
             .await?;
-        Ok(count >= i64::try_from(required).unwrap_or(i64::MAX))
+        Ok(count == i64::try_from(urls.len()).unwrap_or(i64::MAX))
     }
 
     /// # Errors
@@ -1067,6 +1140,7 @@ impl Store {
             operations: status_counts(&self.pool, "connector_operations").await?,
             publications: status_counts(&self.pool, "publication_outbox").await?,
             relays,
+            operator_relay_urls: self.operator_relay_urls().await?,
             connectors,
             recent_events: operator_events(&self.pool).await?,
             recent_work: operator_work(&self.pool).await?,

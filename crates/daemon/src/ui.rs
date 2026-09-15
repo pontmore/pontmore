@@ -170,6 +170,7 @@ pub fn router(state: UiState) -> Router {
         .route("/", get(dashboard))
         .route("/events", get(events_page).post(submit_event))
         .route("/configuration", get(configuration_page))
+        .route("/configuration/relays", post(connect_relay))
         .route("/operations", get(operations_page))
         .route("/controls/execution/pause", post(pause_execution))
         .route("/controls/execution/resume", post(resume_execution))
@@ -247,7 +248,7 @@ async fn configuration_page(
         &headers,
         "configuration",
         notice,
-        |snapshot, csrf| configuration_content(snapshot, &state.config, csrf),
+        |snapshot, csrf| configuration_content(snapshot, &state.config, csrf, "", None),
     )
     .await
 }
@@ -295,6 +296,94 @@ async fn render_section(
 #[derive(Deserialize)]
 struct CsrfInput {
     csrf: String,
+}
+
+#[derive(Deserialize)]
+struct RelayInput {
+    csrf: String,
+    relay_url: String,
+}
+
+async fn connect_relay(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Form(input): Form<RelayInput>,
+) -> Response {
+    if let Some(response) = authorize_form(&state, &headers, &input.csrf) {
+        return response;
+    }
+    let url = match normalize_relay_url(&input.relay_url) {
+        Ok(url) => url,
+        Err(error) => return render_relay_error(&state, &headers, &input.relay_url, error).await,
+    };
+    if state
+        .config
+        .relays
+        .iter()
+        .any(|startup| normalize_relay_url(startup).is_ok_and(|value| value == url))
+    {
+        return Redirect::to("/configuration?notice=relay_already_configured").into_response();
+    }
+    match state.store.add_operator_relay(&url).await {
+        Ok(true) => Redirect::to("/configuration?notice=relay_saved").into_response(),
+        Ok(false) => Redirect::to("/configuration?notice=relay_already_configured").into_response(),
+        Err(error) => control_error(error),
+    }
+}
+
+fn normalize_relay_url(input: &str) -> Result<String, &'static str> {
+    let input = input.trim();
+    if input.is_empty() || input.len() > 2_048 {
+        return Err("Enter a relay URL of at most 2048 characters.");
+    }
+    let mut url = url::Url::parse(input).map_err(|_| "Enter a valid WebSocket relay URL.")?;
+    let host = url.host_str().ok_or("The relay URL needs a host.")?;
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    if url.scheme() != "wss" && !(url.scheme() == "ws" && loopback) {
+        return Err("Use wss:// for remote relays; ws:// is only allowed on loopback.");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err("Relay URLs cannot contain credentials or fragments.");
+    }
+    url.set_fragment(None);
+    Ok(url.into())
+}
+
+async fn render_relay_error(
+    state: &UiState,
+    headers: &HeaderMap,
+    input: &str,
+    error: &str,
+) -> Response {
+    let Some(session) = authenticated_session(state, headers) else {
+        return Redirect::to("/login").into_response();
+    };
+    match state.store.operator_dashboard().await {
+        Ok(snapshot) => (
+            StatusCode::BAD_REQUEST,
+            Html(
+                page(
+                    "Pontmore",
+                    &app_page(
+                        "configuration",
+                        &configuration_content(
+                            &snapshot,
+                            &state.config,
+                            &session.csrf,
+                            input,
+                            Some(error),
+                        ),
+                        None,
+                        &session.csrf,
+                        state.version,
+                    ),
+                )
+                .into_string(),
+            ),
+        )
+            .into_response(),
+        Err(store_error) => operator_error(store_error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -924,6 +1013,10 @@ fn notice_message(notice: Option<&str>) -> Option<&'static str> {
         Some("work_requeued") => Some("Eligible failed work was requeued."),
         Some("publications_requeued") => Some("Failed publications were requeued."),
         Some("connectors_probed") => Some("Connector health probes completed."),
+        Some("relay_saved") => Some(
+            "Relay saved. The daemon is connecting and backfilling it now; it will reconnect after a restart.",
+        ),
+        Some("relay_already_configured") => Some("That relay is already configured."),
         _ => None,
     }
 }
@@ -1031,9 +1124,48 @@ fn configuration_content(
     snapshot: &OperatorDashboard,
     config: &UiRuntimeConfig,
     csrf: &str,
+    relay_input: &str,
+    relay_error: Option<&str>,
 ) -> Markup {
+    let mut effective_relays = config.relays.clone();
+    effective_relays.extend(snapshot.operator_relay_urls.iter().cloned());
+    effective_relays.sort();
+    effective_relays.dedup();
     html! {
-        div class="page-heading" { div { p class="eyebrow" { "Runtime policy" } h1 { "Configuration" } p class="muted" { "Review the effective startup configuration and control automatic economic execution." } } }
+        div class="page-heading" { div { p class="eyebrow" { "Runtime policy" } h1 { "Configuration" } p class="muted" { "Connect relays while running, review startup settings, and control economic execution." } } }
+        section class="panel" {
+            div class="panel-header" { h2 { "Relays" } span class="muted" { (effective_relays.len()) " configured · " a href="/configuration" { "Refresh status" } } }
+            form class="stack relay-form" method="post" action="/configuration/relays" {
+                input type="hidden" name="csrf" value=(csrf);
+                @if let Some(error) = relay_error { div class="error-box" role="alert" { strong { "Relay not added" } p { (error) } } }
+                label for="relay_url" { "Connect a relay" }
+                div class="relay-form-row" {
+                    input id="relay_url" name="relay_url" type="url" autocomplete="url" spellcheck="false" placeholder="wss://relay.example.com" value=(relay_input) required;
+                    button class="button primary" type="submit" { "Connect relay" }
+                }
+                p class="muted" { "Saved relays reconnect after restart. Remote relays require secure WebSockets (wss://)." }
+            }
+            @if effective_relays.is_empty() { div class="empty" { "No relays yet. Add one above to start synchronization." } }
+            @else { div class="table-wrap" { table {
+                thead { tr { th { "Relay" } th { "Source" } th { "Status" } th { "Last connected" } th { "Error" } } }
+                tbody { @for url in &effective_relays {
+                    @let checkpoint = snapshot.relays.iter().find(|relay| relay.relay_url == *url);
+                    tr {
+                        td { code { (url) } }
+                        td { @if snapshot.operator_relay_urls.contains(url) { "Operator" } @else { "Startup" } }
+                        td {
+                            @if let Some(row) = checkpoint {
+                                @if row.last_error.is_some() { span class="badge bad" { "Needs attention" } }
+                                @else if row.backfill_complete && row.last_connected_at.is_some_and(|last| u64::try_from(last).is_ok_and(|last| snapshot.generated_at.saturating_sub(last) < 15)) { span class="badge good" { "Connected" } }
+                                @else { span class="badge" { "Connecting" } }
+                            } @else { span class="badge" { "Connecting" } }
+                        }
+                        td { (optional_time(checkpoint.and_then(|row| row.last_connected_at))) }
+                        td { (optional_text(checkpoint.and_then(|row| row.last_error.as_deref()))) }
+                    }
+                } }
+            } } }
+        }
         section class="panel control-panel" {
             div class="panel-header" { h2 { "Economic execution" } span class=(if snapshot.execution_enabled { "badge good" } else { "badge bad" }) { @if snapshot.execution_enabled { "Enabled" } @else { "Paused" } } }
             div class="panel-body horizontal" {
@@ -1059,12 +1191,7 @@ fn configuration_content(
                 (setting("Connector configuration", config.connector_config.as_deref().unwrap_or("not configured")))
             }
         }
-        section class="panel" {
-            div class="panel-header" { h2 { "Configured relays" } span class="muted" { (config.relays.len()) " total" } }
-            @if config.relays.is_empty() { div class="empty" { "No relays were supplied at startup." } }
-            @else { ul class="item-list" { @for relay in &config.relays { li { code { (relay) } } } } }
-        }
-        p class="muted boundary-note" { "Listeners, relays, connector manifests, secrets, and sandbox launchers remain startup-managed. Change their PONTMORE_ environment values or connector configuration file and restart the daemon." }
+        p class="muted boundary-note" { "Listeners, startup relays, connector manifests, secrets, and sandbox launchers remain restart-managed. Operator-added relays are persisted separately. Change other PONTMORE_ environment values or the connector configuration file and restart the daemon." }
     }
 }
 
@@ -1331,5 +1458,23 @@ mod tests {
             HeaderValue::from_static("https://example.com"),
         );
         assert!(!same_origin(&headers));
+    }
+
+    #[test]
+    fn relay_urls_require_safe_websockets() {
+        assert_eq!(
+            normalize_relay_url(" wss://relay.example.com ").expect("secure relay"),
+            "wss://relay.example.com/"
+        );
+        assert!(normalize_relay_url("ws://127.0.0.1:8080").is_ok());
+        for input in [
+            "https://relay.example.com",
+            "ws://relay.example.com",
+            "wss://user:password@relay.example.com",
+            "wss://relay.example.com/#fragment",
+            "not a URL",
+        ] {
+            assert!(normalize_relay_url(input).is_err(), "accepted {input}");
+        }
     }
 }

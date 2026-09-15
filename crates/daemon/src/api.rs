@@ -27,7 +27,7 @@ pub struct AppState {
     pub stream_sender: broadcast::Sender<StreamEvent>,
     pub shutdown: watch::Receiver<bool>,
     pub max_replay: i64,
-    pub required_relays: usize,
+    pub startup_relays: Vec<String>,
 }
 
 /// Build the deliberately small client API.
@@ -50,7 +50,7 @@ async fn live() -> Json<Value> {
 
 async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     state.store.ready().await?;
-    if !state.store.relay_readiness(state.required_relays).await? {
+    if !state.store.relay_readiness(&state.startup_relays).await? {
         return Err(ApiError::unavailable(
             "RELAY_NOT_READY",
             "relay backfill is not complete",

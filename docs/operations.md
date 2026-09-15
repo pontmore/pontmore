@@ -15,8 +15,13 @@ projections, connector records, and stream cursors are implementation overlays.
   regular owner-only file (mode `0600` on Unix). The current UI is single-operator.
 - Put authenticated transport and authorization in front of the client API before a
   non-loopback deployment. The UI's login is not client API authentication.
-- Configure multiple independently operated relays where practical. Readiness remains
-  false until every configured relay completes its initial backfill.
+- Configure multiple independently operated relays where practical. Startup relays come
+  from `PONTMORE_RELAYS`; operators can add durable relays from Configuration while the
+  daemon is running. Remote operator URLs must use `wss://` (`ws://` is accepted only
+  for loopback development). Readiness remains false until every effective relay
+  completes backfill and has a recent connection heartbeat. A saved but unreachable
+  relay therefore makes readiness false until it connects. The UI shows connection,
+  backfill, and error state; it does not alter signed Nostr events.
 - Set `PONTMORE_REQUIRE_CONNECTOR_SANDBOX=true` for value-bearing deployments. Each
   connector must then name an operator-reviewed launcher. That launcher must enforce a
   dedicated unprivileged identity, read-only mounts, private temporary storage,
@@ -68,8 +73,9 @@ cross-origin form submissions.
 The economic execution switch is durable and shared by daemons using the same database.
 Pausing does not cancel a connector exchange already in flight. Resuming requeues every
 stored coordination; durable operation and connector idempotency remain responsible for
-preventing repeated value movement. Startup-managed configuration is deliberately not
-rewritten from the browser.
+preventing repeated value movement. Operator-added relay URLs are stored in a separate
+database table and rediscovered by the relay worker; other startup-managed configuration
+is deliberately not rewritten from the browser.
 
 The embedded UI has no CDN or runtime package dependency. Its authenticated
 `GET /ui/stream` connection refreshes on daemon events and periodically polls the

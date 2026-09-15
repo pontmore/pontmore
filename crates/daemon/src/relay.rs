@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use futures_util::StreamExt;
 use nostr::event::Event;
@@ -7,7 +7,10 @@ use nostr_sdk::{
     prelude::{Filter, Kind, Timestamp},
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::{
+    sync::{broadcast, watch},
+    task::JoinSet,
+};
 
 use crate::{
     coordinator::{Coordinator, CoordinatorError},
@@ -25,6 +28,8 @@ const PONTMORE_KINDS: [Kind; 4] = [
 pub enum RelayError {
     #[error("relay client: {0}")]
     Client(#[from] nostr_sdk::error::Error),
+    #[error("relay subscription: {0}")]
+    Subscription(String),
     #[error(transparent)]
     Coordinator(#[from] CoordinatorError),
     #[error(transparent)]
@@ -65,55 +70,14 @@ impl RelayService {
     /// # Errors
     /// Returns relay, storage, or coordination errors.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), RelayError> {
-        if self.urls.is_empty() {
-            return Ok(());
-        }
-        for url in &self.urls {
-            self.client.add_relay(url).await?;
-        }
         let mut notifications = self.client.notifications();
-        self.client.connect().await;
-        let mut subscription_since = u64::MAX;
-        for url in &self.urls {
-            let since = self.store.relay_since(url, self.lookback).await?;
-            subscription_since = subscription_since.min(since);
-            let filter = Filter::new()
-                .kinds(PONTMORE_KINDS)
-                .since(Timestamp::from(since));
-            match self
-                .client
-                .fetch_events(ReqTarget::single(url.as_str(), [filter]))
-                .timeout(Duration::from_secs(30))
-                .max_events(50_000)
-                .await
-            {
-                Ok(events) => {
-                    let mut events = events.into_iter().collect::<Vec<_>>();
-                    events.sort_by_key(|event| {
-                        (
-                            relay_priority(event.kind.as_u16()),
-                            event.created_at.as_secs(),
-                            event.id,
-                        )
-                    });
-                    for event in events {
-                        if let Err(error) = self.ingest(&event).await {
-                            tracing::warn!(event_id = %event.id, %error, "relay event rejected");
-                        }
-                    }
-                    self.store.mark_relay_backfilled(url).await?;
-                }
-                Err(error) => {
-                    self.store.mark_relay_error(url, &error.to_string()).await?;
-                    tracing::warn!(relay = %url, %error, "relay backfill failed");
-                }
-            }
-        }
-        let filter = Filter::new()
-            .kinds(PONTMORE_KINDS)
-            .since(Timestamp::from(subscription_since));
-        self.client.subscribe(filter).await?;
         let mut publish_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut relay_tick = tokio::time::interval(Duration::from_secs(5));
+        relay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut known = BTreeSet::new();
+        let mut inflight = BTreeSet::new();
+        let mut active: BTreeSet<String> = BTreeSet::new();
+        let mut setup_tasks = JoinSet::new();
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -127,10 +91,108 @@ impl RelayService {
                     Some(ClientNotification::Shutdown) | None => break,
                     Some(ClientNotification::Message { .. }) => {}
                 },
-                _ = publish_tick.tick() => self.publish_next().await?,
+                _ = publish_tick.tick(), if !active.is_empty() => self.publish_next().await?,
+                _ = relay_tick.tick() => {
+                    match self.store.effective_relay_urls(&self.urls).await {
+                        Ok(urls) => {
+                            for url in urls {
+                                if active.contains(&url) || inflight.contains(&url) { continue; }
+                                if !known.contains(&url) {
+                                    match self.client.add_relay(url.as_str()).await {
+                                        Ok(_) => { known.insert(url.clone()); }
+                                        Err(error) => {
+                                            self.store.mark_relay_error(&url, &error.to_string()).await?;
+                                            tracing::warn!(relay = %url, %error, "relay registration failed");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                inflight.insert(url.clone());
+                                let service = self.clone();
+                                setup_tasks.spawn(async move {
+                                    let result = service.setup_relay(&url).await;
+                                    (url, result)
+                                });
+                            }
+                            for url in &active {
+                                if let Some(relay) = self.client.relay(url.as_str()).await? {
+                                    if relay.status().is_connected() {
+                                        self.store.mark_relay_connected(url).await?;
+                                    } else {
+                                        self.store.mark_relay_disconnected(url).await?;
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "relay discovery failed; retrying"),
+                    }
+                },
+                Some(completed) = setup_tasks.join_next(), if !setup_tasks.is_empty() => {
+                    match completed {
+                        Ok((url, Ok(()))) => {
+                            inflight.remove(&url);
+                            active.insert(url);
+                        }
+                        Ok((url, Err(error))) => {
+                            inflight.remove(&url);
+                            self.store.mark_relay_error(&url, &error.to_string()).await?;
+                            tracing::warn!(relay = %url, %error, "relay setup failed; retrying");
+                        }
+                        Err(error) => {
+                            inflight.clear();
+                            tracing::error!(%error, "relay setup task failed");
+                        }
+                    }
+                },
             }
         }
+        setup_tasks.abort_all();
         self.client.shutdown().await;
+        Ok(())
+    }
+
+    async fn setup_relay(&self, url: &str) -> Result<(), RelayError> {
+        self.client
+            .try_connect_relay(url, Duration::from_secs(10))
+            .await?;
+        let since = self.store.relay_since(url, self.lookback).await?;
+        let filter = Filter::new()
+            .kinds(PONTMORE_KINDS)
+            .since(Timestamp::from(since));
+        let events = self
+            .client
+            .fetch_events(ReqTarget::single(url, [filter.clone()]))
+            .timeout(Duration::from_secs(30))
+            .max_events(50_000)
+            .await?;
+        let mut events = events.into_iter().collect::<Vec<_>>();
+        events.sort_by_key(|event| {
+            (
+                relay_priority(event.kind.as_u16()),
+                event.created_at.as_secs(),
+                event.id,
+            )
+        });
+        for event in events {
+            if let Err(error) = self.ingest(&event).await {
+                tracing::warn!(event_id = %event.id, %error, "relay event rejected");
+            }
+        }
+        let subscription = self
+            .client
+            .subscribe(ReqTarget::single(url, [filter]))
+            .await?;
+        if subscription.success.is_empty() {
+            return Err(RelayError::Subscription(
+                subscription
+                    .failed
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "no relay accepted the subscription".to_owned()),
+            ));
+        }
+        self.store.mark_relay_backfilled(url).await?;
         Ok(())
     }
 

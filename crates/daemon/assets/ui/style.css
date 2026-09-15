@@ -353,7 +353,8 @@ code {
   font-weight: 600;
 }
 textarea,
-.field input {
+.field input,
+.relay-form input[type="url"] {
   width: 100%;
   border: 1px solid #344154;
   border-radius: 0.55rem;
@@ -374,6 +375,20 @@ input:focus {
 .form-actions {
   display: flex;
   justify-content: flex-end;
+}
+.relay-form-row {
+  display: flex;
+  gap: 0.75rem;
+}
+.relay-form-row input {
+  flex: 1;
+  min-width: 0;
+}
+.relay-form-row .button {
+  white-space: nowrap;
+}
+.relay-form p {
+  margin: 0;
 }
 .settings {
   display: grid;
@@ -466,6 +481,9 @@ input:focus {
   width: 100%;
 }
 @media (max-width: 42rem) {
+  .relay-form-row {
+    flex-direction: column;
+  }
   .topbar {
     align-items: flex-start;
     flex-direction: column;
