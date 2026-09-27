@@ -2,41 +2,94 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Docker Hub repository; override with the DOCKERHUB_IMAGE repository variable.
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'pontmore/pontmored' }}
+
 jobs:
-  rust:
+  flake:
+    name: Flake checks
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_DB: pontmore_test
-          POSTGRES_USER: pontmore
-          POSTGRES_PASSWORD: pontmore
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U pontmore -d pontmore_test" --health-interval 2s
-          --health-timeout 2s --health-retries 20
-    env:
-      PONTMORE_TEST_DATABASE_URL: postgres://pontmore:pontmore@127.0.0.1:5432/pontmore_test
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Check toolchain pin, clippy, tests, TCK, and image
+        run: nix flake check --print-build-logs
+
+  dev-shell:
+    name: Dev shell checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      # Also runs the PostgreSQL integration and connector-process tests that the
+      # sandboxed flake checks skip.
+      - name: Format, lint, test, TCK, and restart smoke
+        run: |
+          nix develop --command bash -euc '
+            just db-up
+            just check
+            just restart-smoke "postgres://pontmore@127.0.0.1:55432/pontmore"
+          '
+
+  containers:
+    name: Container (${{ matrix.arch }})
+    needs: [flake, dev-shell]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Build image
+        run: nix develop --command just image
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
         with:
-          toolchain: 1.98.1
-          components: clippy,rustfmt
-      - uses: extractions/setup-just@v3
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish
+        if: github.event_name == 'push'
+        run:
+          nix develop --command just image-publish "$IMAGE" $(scripts/ci-image-tags.sh)
+
+  manifest:
+    name: Multi-arch manifest
+    needs: containers
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
         with:
-          just-version: 1.58.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: just check
-      - run: just restart-smoke "$PONTMORE_TEST_DATABASE_URL"
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish manifests
+        run: |
+          for tag in $(scripts/ci-image-tags.sh); do
+            nix develop --command just image-manifest "$IMAGE" "$tag"
+          done

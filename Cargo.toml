@@ -58,3 +58,9 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# Used by the Nix `ci` build profile: dev codegen without full debug info.
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = false

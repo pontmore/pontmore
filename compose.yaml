@@ -14,7 +14,9 @@ services:
       - pontmore-postgres:/var/lib/postgresql/data
 
   pontmored:
-    build: .
+    # Built by Nix and loaded by `just docker-up` (scripts/container-image.sh).
+    image: ${PONTMORE_IMAGE:-pontmored:local}
+    pull_policy: never
     # Local-only override: reads the owner-only bind-mounted operator password.
     user: "0:0"
     depends_on:

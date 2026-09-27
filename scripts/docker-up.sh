@@ -29,6 +29,8 @@ fi
 
 chmod 600 "${password_file}"
 
-docker compose -p pontmore-local up --build --detach --wait
+export PONTMORE_IMAGE=${PONTMORE_IMAGE:-pontmored:local}
+bash scripts/container-image.sh load "${PONTMORE_IMAGE}" >/dev/null
+docker compose -p pontmore-local up --detach --wait
 printf 'Local Docker stack is running. Ports are configured in %s.\n' "${env_file}"
 printf 'Operator UI password is in %s.\n' "${password_file}"
