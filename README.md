@@ -62,17 +62,62 @@ tck/vectors/            language-neutral executable cases
 
 ## Run
 
+Every development and production dependency is declared in the Nix flake, following the
+[Fedimint](https://github.com/fedimint/fedimint) flakebox pattern. Install Nix with
+flakes enabled, then enter the development shell:
+
 ```console
+nix develop
 just setup
+just db-up        # local PostgreSQL from Nix on 127.0.0.1:55432
 just format
 just check
+just daemon --database-url postgres://pontmore@127.0.0.1:55432/pontmore
 
 # Equivalent individual Cargo commands:
 cargo test --workspace
 cargo run -p pontmore-tck -- tck/vectors
-cargo run -p pontmored -- --database-url postgres://localhost/pontmore
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+The shell provides the Rust toolchain pinned by `rust-toolchain.toml`, `just`,
+PostgreSQL, Python for the example connector, the locked prettier formatters (linked
+into `node_modules` from `package-lock.json`), nixfmt, shellcheck, cargo-audit, and the
+Docker, skopeo, and manifest-tool clients. It also installs flakebox git hooks.
+`nix develop .#lint` is a smaller shell for formatting checks.
+
+Hermetic builds and checks run without the shell:
+
+```console
+nix build .#pontmored              # daemon binary
+nix build .#pontmore-tck           # compatibility-vector runner
+nix build .#container.pontmored    # OCI image archive
+nix flake check                    # toolchain pin, clippy, tests, TCK, image
+nix build .#workspaceAudit         # RustSec advisory audit (non-blocking)
+```
+
+The sandboxed `workspaceTest` check skips the PostgreSQL integration test and the tests
+that launch the example connector, whose digest-pinned entrypoint requires a host
+`/usr/bin/python3`; `just check` in the development shell runs them.
+
+## Container image
+
+`nix build .#container.pontmored` produces a layered OCI image containing only
+`pontmored`, CA certificates, and an unprivileged `pontmore` user (UID 7300). It exposes
+ports 7300 and 7301.
+
+```console
+just image-load                                  # build and load as pontmored:local
+just image-publish pontmore/pontmored v0.1.0     # push pontmore/pontmored:v0.1.0-<arch>
+just image-manifest pontmore/pontmored v0.1.0    # join -amd64 and -arm64 tags
+```
+
+Publishing uses credentials from `docker login` or `skopeo login`. CI builds the image
+on amd64 and arm64 for every change. On pushes to `main` and `v*` tags it publishes to
+Docker Hub and creates multi-architecture manifests (`main`, `sha-<commit>`, the release
+tag, and `latest` for `vX.Y.Z` tags). Configure the `DOCKERHUB_USERNAME` repository
+variable and the `DOCKERHUB_TOKEN` secret, and optionally `DOCKERHUB_IMAGE` (default
+`pontmore/pontmored`).
 
 ## `pontmored`
 
@@ -80,14 +125,10 @@ The client API defaults to `127.0.0.1:7300`. It verifies every signed event befo
 durable storage. Public signed events remain canonical; projections, stream cursors,
 connector operations, and private database records are implementation overlays.
 
-After cloning, run `just setup` to fetch Rust crates with the pinned toolchain and
-install the locked npm formatters. The npm packages are development-only: the daemon and
-embedded UI run without Node.js. For Rust-only work, use `just setup-rust`; run
-`just setup-format` before `just format` or `just check`. Install `just` and `rustup`
-first; the formatting recipe also requires Node.js/npm. The local container recipes
-additionally require Docker with Compose and OpenSSL.
+The npm formatter packages are development-only: the daemon and embedded UI run without
+Node.js. The local container recipes additionally require a running Docker daemon.
 
-Start or stop a local Docker node with:
+Start or stop a local Docker node with the Nix-built image:
 
 ```console
 just docker-up

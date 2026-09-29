@@ -2,8 +2,8 @@
   "name": "pontmore-workspace",
   "private": true,
   "scripts": {
-    "format:files": "prettier --write \"**/*.{css,js,md,json,yml,yaml,toml}\" && prettier --parser toml --write Cargo.lock",
-    "format:files:check": "prettier --check \"**/*.{css,js,md,json,yml,yaml,toml}\" && prettier --parser toml --check Cargo.lock"
+    "format:files": "prettier --write \"**/*.{css,js,md,json,yml,yaml,toml}\"",
+    "format:files:check": "prettier --check \"**/*.{css,js,md,json,yml,yaml,toml}\""
   },
   "devDependencies": {
     "prettier": "3.9.6",
